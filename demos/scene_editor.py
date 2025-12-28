@@ -185,6 +185,8 @@ class EditorMode(Enum):
     LINE = auto()
     BOX = auto()
     HELP = auto()
+    ANIMATION_EDITOR = auto()    # Animation assembly screen
+    ANIMATION_PREVIEW = auto()   # Full-screen animation preview
 
 
 @dataclass
@@ -241,22 +243,50 @@ class SpriteFrame:
 
 
 @dataclass
+class AnimationFrame:
+    """Single frame in an animation with optional pixel offset"""
+    frame_index: int  # Index into sprite's frames list
+    offset_x: int = 0  # Pixel offset for lunges, jumps, etc.
+    offset_y: int = 0
+
+
+@dataclass
+class AnimationDef:
+    """Named animation sequence"""
+    name: str
+    frames: List['AnimationFrame'] = field(default_factory=list)  # Frames with offsets
+    frame_duration: float = 0.2  # Seconds per frame
+    loop: bool = True
+
+
+@dataclass
 class SpriteData:
     """Complete sprite definition (may contain multiple frames)"""
     name: str
     width: int
     height: int
     frames: List[SpriteFrame] = field(default_factory=lambda: [SpriteFrame()])
+    animations: Dict[str, AnimationDef] = field(default_factory=dict)
     default_fg: Tuple[int, int, int] = field(default_factory=lambda: DEFAULT_FG)
 
     def to_dict(self) -> dict:
         """Convert to serializable format for SPRITE_DEFS"""
-        return {
+        result = {
             'width': self.width,
             'height': self.height,
             'default_fg': self.default_fg,
             'frames': [f.to_dict(self.width, self.height) for f in self.frames],
         }
+        if self.animations:
+            result['animations'] = {
+                name: {
+                    'frames': [(af.frame_index, af.offset_x, af.offset_y) for af in anim.frames],
+                    'frame_duration': anim.frame_duration,
+                    'loop': anim.loop,
+                }
+                for name, anim in self.animations.items()
+            }
+        return result
 
     @staticmethod
     def from_dict(name: str, d: dict) -> 'SpriteData':
@@ -268,6 +298,19 @@ class SpriteData:
             default_fg=tuple(d.get('default_fg', DEFAULT_FG)),
         )
         sprite.frames = [SpriteFrame.from_dict(f) for f in d.get('frames', [{}])]
+        # Load animations
+        if 'animations' in d:
+            for anim_name, anim_data in d['animations'].items():
+                anim_frames = [
+                    AnimationFrame(frame_index=f[0], offset_x=f[1], offset_y=f[2])
+                    for f in anim_data.get('frames', [])
+                ]
+                sprite.animations[anim_name] = AnimationDef(
+                    name=anim_name,
+                    frames=anim_frames,
+                    frame_duration=anim_data.get('frame_duration', 0.2),
+                    loop=anim_data.get('loop', True),
+                )
         return sprite
 
 
@@ -335,6 +378,18 @@ class EditorState:
     last_selected_codepoint: int = 0x2500  # For vicinity mode
     codepoint_buffer: str = ""             # For typing codepoints
 
+    # Animation state
+    animations: Dict[str, AnimationDef] = field(default_factory=dict)
+    current_animation: Optional[str] = None  # Currently selected animation name
+    animation_playing: bool = False          # Whether animation is auto-playing
+    animation_timer: float = 0.0             # For frame timing
+    animation_frame_idx: int = 0             # Current position in animation sequence
+
+    # Animation editor state
+    anim_editor_cursor: int = 0              # Selected animation in list
+    anim_editor_frame_cursor: int = 0        # Selected frame within animation
+    anim_editor_mode: str = "list"           # "list" or "edit"
+
     def get_cell(self, x: int, y: int) -> Optional[Cell]:
         return self.cells.get((x, y))
 
@@ -367,6 +422,7 @@ state = EditorState()
 root = None           # Root window (background)
 sprite_win = None     # Sprite editing window
 status_win = None     # Status bar window (high z-index)
+preview_sprite = None # Pyunicodegame sprite for animation preview
 
 
 # ============================================================================
@@ -384,6 +440,8 @@ MODE_DISPLAY = {
     EditorMode.LINE: ("-- LINE --", (100, 255, 255)),
     EditorMode.BOX: ("-- BOX --", (255, 100, 200)),
     EditorMode.HELP: ("-- HELP --", (255, 255, 255)),
+    EditorMode.ANIMATION_EDITOR: ("-- ANIMATION --", (255, 150, 50)),
+    EditorMode.ANIMATION_PREVIEW: ("-- PREVIEW --", (100, 255, 100)),
 }
 
 
@@ -405,6 +463,12 @@ def render():
         return
     if state.mode == EditorMode.PALETTE_CODEPOINT:
         render_palette_codepoint()
+        return
+    if state.mode == EditorMode.ANIMATION_EDITOR:
+        render_animation_editor()
+        return
+    if state.mode == EditorMode.ANIMATION_PREVIEW:
+        render_animation_preview()
         return
 
     # Draw border/frame on root window around sprite area
@@ -520,6 +584,47 @@ def adjust_codepoint(delta: int):
     state.set_status(f"U+{new_code:04X}: {state.current_char}")
 
 
+def switch_frame(delta: int):
+    """Switch to a different frame, saving current frame first."""
+    if len(state.frames) <= 1 and delta != 0:
+        state.set_status("Only 1 frame - use :frame to add more")
+        return
+
+    # Save current frame
+    state.frames[state.current_frame].cells = dict(state.cells)
+
+    # Calculate new frame index
+    new_frame = (state.current_frame + delta) % len(state.frames)
+    state.current_frame = new_frame
+
+    # Load new frame
+    state.cells = dict(state.frames[new_frame].cells)
+    state.set_status(f"Frame {new_frame + 1}/{len(state.frames)}")
+
+
+def toggle_animation_playback():
+    """Toggle animation auto-playback on/off."""
+    if len(state.frames) <= 1:
+        state.set_status("Need multiple frames for animation")
+        return
+
+    state.animation_playing = not state.animation_playing
+    state.animation_timer = 0.0
+
+    if state.animation_playing:
+        # If we have a selected animation, use its frame sequence
+        if state.current_animation and state.current_animation in state.animations:
+            anim = state.animations[state.current_animation]
+            state.animation_frame_idx = 0
+            state.set_status(f"Playing [{state.current_animation}] - Tab to stop")
+        else:
+            # Just cycle through all frames
+            state.animation_frame_idx = state.current_frame
+            state.set_status("Playing all frames - Tab to stop")
+    else:
+        state.set_status(f"Stopped at frame {state.current_frame + 1}/{len(state.frames)}")
+
+
 def render_mini_palette():
     """Render the mini palette bar above status on status window"""
     palette_row = 0  # First row of status window
@@ -565,10 +670,18 @@ def render_status_bar():
     # Frame info (sprite mode only)
     if state.editor_mode == "sprite" and len(state.frames) > 1:
         frame_text = f"F{state.current_frame + 1}/{len(state.frames)}"
-        status_win.put_string(30, status_row, frame_text, (150, 150, 200))
+        if state.animation_playing:
+            if state.current_animation:
+                frame_text = f"[{state.current_animation}] {frame_text} ▶"
+            else:
+                frame_text = f"{frame_text} ▶"
+            status_win.put_string(30, status_row, frame_text, (100, 255, 100))
+        else:
+            status_win.put_string(30, status_row, frame_text, (150, 150, 200))
 
-    # Current character with color indicator
-    status_win.put(32, status_row, state.current_char, state.current_fg)
+    # Current character with color indicator (adjust position based on frame text)
+    char_pos = 50 if state.animation_playing and state.current_animation else 40 if len(state.frames) > 1 else 32
+    status_win.put(char_pos, status_row, state.current_char, state.current_fg)
 
     # Sprite name or file path (right-aligned, leave room for char display)
     if state.editor_mode == "sprite":
@@ -906,11 +1019,220 @@ def render_help_overlay():
     root.put_string(33, y2, ":w file", key_color); root.put_string(48, y2, "Save", desc_color); y2 += 1
     root.put_string(33, y2, ":q :wq", key_color); root.put_string(48, y2, "Quit", desc_color); y2 += 1
     root.put_string(33, y2, ":frame", key_color); root.put_string(48, y2, "Add frame", desc_color); y2 += 1
+    root.put_string(33, y2, ":anim", key_color); root.put_string(48, y2, "Animation editor", desc_color); y2 += 1
+
+    # Animation (continued in left column)
+    root.put_string(2, y, "ANIMATION", heading_color); y += 1
+    root.put_string(4, y, ", .", key_color); root.put_string(14, y, "Prev/next frame", desc_color); y += 1
+    root.put_string(4, y, "Tab", key_color); root.put_string(14, y, "Play/stop anim", desc_color); y += 1
 
     # Footer
     root.put_string(0, h - 2, "═" * w, (60, 60, 80))
     footer = "Press any key to close"
     root.put_string((w - len(footer)) // 2, h - 1, footer, (150, 150, 150))
+
+
+def render_animation_editor():
+    """Render full-screen animation assembly editor"""
+    # Hide other windows during animation editor
+    sprite_win.visible = False
+    status_win.visible = False
+
+    w, h = ROOT_WIDTH, ROOT_HEIGHT
+    title_color = (255, 150, 50)
+    heading_color = (255, 200, 100)
+    selected_color = (100, 255, 100)
+    normal_color = (180, 180, 180)
+    dim_color = (100, 100, 120)
+
+    # Background
+    for y in range(h):
+        for x in range(w):
+            root.put(x, y, ' ', (30, 30, 40))
+
+    # Title
+    title = "ANIMATION EDITOR"
+    root.put_string((w - len(title)) // 2, 1, title, title_color)
+    root.put_string(0, 2, "═" * w, (60, 60, 80))
+
+    # Get list of animations
+    anim_names = sorted(state.animations.keys()) if state.animations else []
+
+    if state.anim_editor_mode == "list":
+        # Left side: Animation list
+        root.put_string(2, 4, "ANIMATIONS", heading_color)
+        root.put_string(2, 5, "─" * 20, dim_color)
+
+        if not anim_names:
+            root.put_string(2, 7, "(no animations)", dim_color)
+            root.put_string(2, 8, "Press 'n' to create", dim_color)
+        else:
+            for i, name in enumerate(anim_names):
+                y = 7 + i
+                if y >= h - 4:
+                    break
+                anim = state.animations[name]
+                is_selected = i == state.anim_editor_cursor
+                color = selected_color if is_selected else normal_color
+                prefix = ">" if is_selected else " "
+                frame_count = len(anim.frames)
+                loop_indicator = "⟳" if anim.loop else "→"
+                root.put_string(2, y, f"{prefix} {name}", color)
+                root.put_string(20, y, f"{frame_count}f {loop_indicator}", dim_color)
+
+        # Right side: Selected animation details
+        root.put_string(32, 4, "DETAILS", heading_color)
+        root.put_string(32, 5, "─" * 25, dim_color)
+
+        if anim_names and 0 <= state.anim_editor_cursor < len(anim_names):
+            anim_name = anim_names[state.anim_editor_cursor]
+            anim = state.animations[anim_name]
+            root.put_string(32, 7, f"Name: {anim_name}", normal_color)
+            root.put_string(32, 8, f"Duration: {anim.frame_duration:.2f}s/frame", normal_color)
+            root.put_string(32, 9, f"Loop: {'Yes' if anim.loop else 'No'}", normal_color)
+            root.put_string(32, 10, f"Frames: {len(anim.frames)}", normal_color)
+
+            # Show frame sequence
+            root.put_string(32, 12, "Sequence:", heading_color)
+            seq = " ".join(f"F{af.frame_index+1}" + (f"({af.offset_x},{af.offset_y})" if af.offset_x or af.offset_y else "")
+                         for af in anim.frames[:8])
+            if len(anim.frames) > 8:
+                seq += "..."
+            root.put_string(32, 13, seq[:26], dim_color)
+        else:
+            root.put_string(32, 7, "(select an animation)", dim_color)
+
+    else:  # edit mode
+        # Show frame editing for selected animation
+        if anim_names and 0 <= state.anim_editor_cursor < len(anim_names):
+            anim_name = anim_names[state.anim_editor_cursor]
+            anim = state.animations[anim_name]
+
+            root.put_string(2, 4, f"EDITING: {anim_name}", heading_color)
+            # Show duration and loop status
+            root.put_string(25, 4, f"Duration: {anim.frame_duration:.2f}s", normal_color)
+            root.put_string(45, 4, f"Loop: {'ON' if anim.loop else 'OFF'}", selected_color if anim.loop else dim_color)
+            root.put_string(2, 5, "─" * 56, dim_color)
+
+            # Show frames in animation
+            root.put_string(2, 7, "FRAMES IN ANIMATION", heading_color)
+            root.put_string(2, 8, "Frame   Offset", dim_color)
+            if not anim.frames:
+                root.put_string(2, 10, "(empty - press 1-9 to add frames)", dim_color)
+            for i, af in enumerate(anim.frames):
+                y = 10 + i
+                if y >= h - 6:
+                    break
+                is_selected = i == state.anim_editor_frame_cursor
+                color = selected_color if is_selected else normal_color
+                prefix = ">" if is_selected else " "
+                offset_str = f"({af.offset_x:+d},{af.offset_y:+d})"
+                root.put_string(2, y, f"{prefix} F{af.frame_index + 1}", color)
+                root.put_string(10, y, offset_str, color)
+
+            # Show available sprite frames on right
+            root.put_string(32, 7, f"SPRITE FRAMES (1-{min(len(state.frames), 9)})", heading_color)
+            for i in range(min(len(state.frames), 9)):
+                marker = "+" if any(af.frame_index == i for af in anim.frames) else " "
+                root.put_string(32, 9 + i, f"{marker} {i+1}: Frame {i + 1}", dim_color)
+
+    # Controls at bottom
+    root.put_string(0, h - 5, "═" * w, (60, 60, 80))
+    if state.anim_editor_mode == "list":
+        root.put_string(2, h - 4, "j/k:Navigate  n:New  Enter:Edit  d:Delete  Space:Preview  Esc:Close", dim_color)
+    else:
+        root.put_string(2, h - 4, "1-9:Add frame  a:Add current  d:Remove  j/k:Select  [/]:Reorder", dim_color)
+        root.put_string(2, h - 3, "h/l:X offset  J/K:Y offset (shift)  0:Reset offset", dim_color)
+        root.put_string(2, h - 2, "+/-:Duration  L:Loop toggle  Space:Preview  Esc:Back", dim_color)
+
+
+def start_animation_preview():
+    """Create real pyunicodegame sprite for animation preview"""
+    global preview_sprite
+
+    if not state.current_animation or state.current_animation not in state.animations:
+        return
+
+    anim_def = state.animations[state.current_animation]
+    if not anim_def.frames:
+        return
+
+    # Convert our frames to pyunicodegame SpriteFrame objects
+    pug_frames = []
+    for our_frame in state.frames:
+        # Build 2D char and color arrays
+        chars = []
+        fg_colors = []
+        for y in range(state.canvas_height):
+            char_row = []
+            color_row = []
+            for x in range(state.canvas_width):
+                cell = our_frame.cells.get((x, y))
+                if cell:
+                    char_row.append(cell.char)
+                    color_row.append(cell.fg)
+                else:
+                    char_row.append(' ')
+                    color_row.append(None)
+            chars.append(char_row)
+            fg_colors.append(color_row)
+
+        pug_frame = pyunicodegame.SpriteFrame(chars, fg_colors)
+        pug_frames.append(pug_frame)
+
+    # Create the sprite
+    preview_sprite = pyunicodegame.Sprite(pug_frames, fg=DEFAULT_FG)
+
+    # Center it on screen
+    center_x = (ROOT_WIDTH - state.canvas_width) // 2
+    center_y = (ROOT_HEIGHT - state.canvas_height) // 2
+    preview_sprite.x = center_x
+    preview_sprite.y = center_y
+    preview_sprite._teleport_pending = True
+
+    # Build animation from our AnimationDef
+    frame_indices = [af.frame_index for af in anim_def.frames]
+    offsets = [(float(af.offset_x), float(af.offset_y)) for af in anim_def.frames]
+
+    pug_anim = pyunicodegame.Animation(
+        name=anim_def.name,
+        frame_indices=frame_indices,
+        frame_duration=anim_def.frame_duration,
+        offsets=offsets,
+        loop=anim_def.loop,
+        offset_speed=50.0  # Smooth interpolation for offsets
+    )
+    preview_sprite.add_animation(pug_anim)
+    preview_sprite.play_animation(anim_def.name)
+
+    # Add to root window for rendering
+    root.add_sprite(preview_sprite)
+
+
+def stop_animation_preview():
+    """Clean up animation preview sprite"""
+    global preview_sprite
+
+    if preview_sprite and root:
+        root.remove_sprite(preview_sprite)
+        preview_sprite = None
+
+
+def render_animation_preview():
+    """Render full-screen animation preview using real pyunicodegame sprite"""
+    sprite_win.visible = False
+    status_win.visible = False
+
+    w, h = ROOT_WIDTH, ROOT_HEIGHT
+
+    # Clear background - the sprite will render on top automatically
+    for y in range(h):
+        for x in range(w):
+            root.put(x, y, ' ', (20, 20, 30))
+
+    # Show help at bottom
+    help_text = "Press Space/Esc/Q to exit preview"
+    root.put_string((w - len(help_text)) // 2, h - 1, help_text, (100, 100, 120))
 
 
 # ============================================================================
@@ -939,6 +1261,193 @@ def on_key(key):
         handle_palette_qwerty(key)
     elif state.mode == EditorMode.PALETTE_CODEPOINT:
         handle_palette_codepoint(key)
+    elif state.mode == EditorMode.ANIMATION_EDITOR:
+        handle_animation_editor(key)
+    elif state.mode == EditorMode.ANIMATION_PREVIEW:
+        handle_animation_preview(key)
+
+
+def handle_animation_preview(key):
+    """Handle keys in animation preview mode"""
+    if is_escape(key) or key == pygame.K_SPACE or key == pygame.K_q:
+        # Stop animation and return to editor
+        stop_animation_preview()
+        state.animation_playing = False
+        state.mode = EditorMode.ANIMATION_EDITOR
+        sprite_win.visible = False
+        status_win.visible = False
+
+
+def handle_animation_editor(key):
+    """Handle keys in animation editor mode"""
+    anim_names = sorted(state.animations.keys()) if state.animations else []
+
+    if is_escape(key):
+        if state.anim_editor_mode == "edit":
+            # Go back to list mode
+            state.anim_editor_mode = "list"
+            state.anim_editor_frame_cursor = 0
+        else:
+            # Exit animation editor
+            state.mode = EditorMode.NORMAL
+            sprite_win.visible = True
+            status_win.visible = True
+        return
+
+    if state.anim_editor_mode == "list":
+        # List mode navigation
+        if key in (pygame.K_j, pygame.K_DOWN):
+            if anim_names:
+                state.anim_editor_cursor = (state.anim_editor_cursor + 1) % len(anim_names)
+        elif key in (pygame.K_k, pygame.K_UP):
+            if anim_names:
+                state.anim_editor_cursor = (state.anim_editor_cursor - 1) % len(anim_names)
+
+        elif key == pygame.K_n:
+            # Create new animation
+            # For now, create with a default name
+            base_name = "anim"
+            counter = 1
+            while f"{base_name}{counter}" in state.animations:
+                counter += 1
+            new_name = f"{base_name}{counter}"
+            state.animations[new_name] = AnimationDef(name=new_name, frames=[])
+            state.set_status(f"Created animation: {new_name}")
+
+        elif key == pygame.K_RETURN:
+            # Enter edit mode for selected animation
+            if anim_names and 0 <= state.anim_editor_cursor < len(anim_names):
+                state.anim_editor_mode = "edit"
+                state.anim_editor_frame_cursor = 0
+
+        elif key == pygame.K_d:
+            # Delete selected animation
+            if anim_names and 0 <= state.anim_editor_cursor < len(anim_names):
+                anim_name = anim_names[state.anim_editor_cursor]
+                del state.animations[anim_name]
+                if state.current_animation == anim_name:
+                    state.current_animation = None
+                state.anim_editor_cursor = max(0, state.anim_editor_cursor - 1)
+                state.set_status(f"Deleted animation: {anim_name}")
+
+        elif key == pygame.K_SPACE:
+            # Preview selected animation in dedicated preview mode
+            if anim_names and 0 <= state.anim_editor_cursor < len(anim_names):
+                anim_name = anim_names[state.anim_editor_cursor]
+                if state.animations[anim_name].frames:
+                    state.current_animation = anim_name
+                    state.animation_frame_idx = 0
+                    state.animation_timer = 0
+                    state.animation_playing = True
+                    state.mode = EditorMode.ANIMATION_PREVIEW
+                    start_animation_preview()
+                else:
+                    state.set_status("Animation has no frames")
+
+    else:  # edit mode
+        if not anim_names or state.anim_editor_cursor >= len(anim_names):
+            return
+        anim_name = anim_names[state.anim_editor_cursor]
+        anim = state.animations[anim_name]
+
+        if key in (pygame.K_j, pygame.K_DOWN):
+            if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                # Shift+J: Decrease Y offset (move down visually)
+                if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
+                    anim.frames[state.anim_editor_frame_cursor].offset_y += 1
+            else:
+                # Navigate down in frame list
+                if anim.frames:
+                    state.anim_editor_frame_cursor = (state.anim_editor_frame_cursor + 1) % len(anim.frames)
+
+        elif key in (pygame.K_k, pygame.K_UP):
+            if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                # Shift+K: Increase Y offset (move up visually)
+                if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
+                    anim.frames[state.anim_editor_frame_cursor].offset_y -= 1
+            else:
+                # Navigate up in frame list
+                if anim.frames:
+                    state.anim_editor_frame_cursor = (state.anim_editor_frame_cursor - 1) % len(anim.frames)
+
+        elif key == pygame.K_h:
+            # Decrease X offset
+            if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
+                anim.frames[state.anim_editor_frame_cursor].offset_x -= 1
+
+        elif key == pygame.K_l:
+            if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                # Shift+L: Toggle loop
+                anim.loop = not anim.loop
+                state.set_status(f"Loop: {'On' if anim.loop else 'Off'}")
+            else:
+                # Increase X offset
+                if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
+                    anim.frames[state.anim_editor_frame_cursor].offset_x += 1
+
+        elif key == pygame.K_a:
+            # Add current sprite frame to animation
+            anim.frames.append(AnimationFrame(frame_index=state.current_frame))
+            state.anim_editor_frame_cursor = len(anim.frames) - 1
+            state.set_status(f"Added frame {state.current_frame + 1}")
+
+        elif key == pygame.K_d:
+            # Remove selected frame from animation
+            if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
+                del anim.frames[state.anim_editor_frame_cursor]
+                state.anim_editor_frame_cursor = max(0, min(state.anim_editor_frame_cursor, len(anim.frames) - 1))
+                state.set_status("Frame removed")
+
+        elif key == pygame.K_LEFTBRACKET:
+            # Move frame earlier in sequence
+            if anim.frames and state.anim_editor_frame_cursor > 0:
+                i = state.anim_editor_frame_cursor
+                anim.frames[i], anim.frames[i-1] = anim.frames[i-1], anim.frames[i]
+                state.anim_editor_frame_cursor -= 1
+
+        elif key == pygame.K_RIGHTBRACKET:
+            # Move frame later in sequence
+            if anim.frames and state.anim_editor_frame_cursor < len(anim.frames) - 1:
+                i = state.anim_editor_frame_cursor
+                anim.frames[i], anim.frames[i+1] = anim.frames[i+1], anim.frames[i]
+                state.anim_editor_frame_cursor += 1
+
+        elif key == pygame.K_0:
+            # Reset offset to (0, 0)
+            if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
+                anim.frames[state.anim_editor_frame_cursor].offset_x = 0
+                anim.frames[state.anim_editor_frame_cursor].offset_y = 0
+                state.set_status("Offset reset")
+
+        elif key == pygame.K_EQUALS:
+            # Increase animation duration
+            anim.frame_duration = min(5.0, anim.frame_duration + 0.05)
+            state.set_status(f"Duration: {anim.frame_duration:.2f}s")
+
+        elif key == pygame.K_MINUS:
+            # Decrease animation duration
+            anim.frame_duration = max(0.02, anim.frame_duration - 0.05)
+            state.set_status(f"Duration: {anim.frame_duration:.2f}s")
+
+        elif key == pygame.K_SPACE:
+            # Preview animation in dedicated preview mode
+            if anim.frames:
+                state.current_animation = anim_name
+                state.animation_frame_idx = 0
+                state.animation_timer = 0
+                state.animation_playing = True
+                state.mode = EditorMode.ANIMATION_PREVIEW
+                start_animation_preview()
+            else:
+                state.set_status("Animation has no frames")
+
+        elif pygame.K_1 <= key <= pygame.K_9:
+            # Quick add frame by number
+            frame_num = key - pygame.K_1
+            if frame_num < len(state.frames):
+                anim.frames.append(AnimationFrame(frame_index=frame_num))
+                state.anim_editor_frame_cursor = len(anim.frames) - 1
+                state.set_status(f"Added frame {frame_num + 1}")
 
 
 def handle_normal_mode(key):
@@ -1033,26 +1542,17 @@ def handle_normal_mode(key):
             state.palette_cursor = 0
             state.palette_scroll = 0
 
-    elif key == pygame.K_n:
-        # n/N = next/prev palette category (quick access)
-        if pygame.key.get_mods() & pygame.KMOD_SHIFT:
-            state.palette_category = (state.palette_category - 1) % len(PALETTE_CATEGORIES)
-        else:
-            state.palette_category = (state.palette_category + 1) % len(PALETTE_CATEGORIES)
-        cat_name, _ = PALETTE_CATEGORIES[state.palette_category]
-        state.set_status(f"Category: {cat_name}")
-
     elif key == pygame.K_COMMA:
-        # , = prev palette category
-        state.palette_category = (state.palette_category - 1) % len(PALETTE_CATEGORIES)
-        cat_name, _ = PALETTE_CATEGORIES[state.palette_category]
-        state.set_status(f"Category: {cat_name}")
+        # , = previous frame
+        switch_frame(-1)
 
     elif key == pygame.K_PERIOD:
-        # . = next palette category
-        state.palette_category = (state.palette_category + 1) % len(PALETTE_CATEGORIES)
-        cat_name, _ = PALETTE_CATEGORIES[state.palette_category]
-        state.set_status(f"Category: {cat_name}")
+        # . = next frame
+        switch_frame(1)
+
+    elif key == pygame.K_TAB:
+        # Tab = toggle animation playback
+        toggle_animation_playback()
 
     elif key == pygame.K_LEFTBRACKET:
         # [ = decrement codepoint by 1, { = by 100
@@ -1402,8 +1902,10 @@ def handle_command_mode(key):
 
     if key == pygame.K_RETURN:
         execute_command(state.command_buffer)
-        state.mode = EditorMode.NORMAL
         state.command_buffer = ""
+        # Only reset to NORMAL if command didn't change to a different mode
+        if state.mode == EditorMode.COMMAND:
+            state.mode = EditorMode.NORMAL
         return
 
     if key == pygame.K_BACKSPACE:
@@ -1634,6 +2136,9 @@ def execute_command(cmd: str):
         # List all frames
         state.set_status(f"Frames: {len(state.frames)} (current: {state.current_frame + 1})")
 
+    elif command in ('anim', 'animation'):
+        handle_anim_command(args)
+
     elif command == 'set':
         handle_set_command(args)
 
@@ -1804,6 +2309,78 @@ def handle_frame_command(args: str):
         state.set_status("Usage: :frame [N] - add new frame or switch to frame N")
 
 
+def handle_anim_command(args: str):
+    """Handle :anim command for animation management"""
+    args = args.strip()
+
+    if not args:
+        # Open animation editor
+        state.mode = EditorMode.ANIMATION_EDITOR
+        state.anim_editor_mode = "list"
+        state.anim_editor_cursor = 0
+        sprite_win.visible = False
+        status_win.visible = False
+
+    elif args.startswith('new '):
+        # Create new animation with given name
+        name = args[4:].strip()
+        if not name:
+            state.set_status("Usage: :anim new <name>")
+        elif name in state.animations:
+            state.set_status(f"Animation '{name}' already exists")
+        else:
+            state.animations[name] = AnimationDef(name=name, frames=[])
+            state.set_status(f"Created animation: {name}")
+
+    elif args.startswith('delete ') or args.startswith('del '):
+        # Delete animation
+        name = args.split(maxsplit=1)[1].strip() if ' ' in args else ""
+        if not name:
+            state.set_status("Usage: :anim delete <name>")
+        elif name not in state.animations:
+            state.set_status(f"Animation '{name}' not found")
+        else:
+            del state.animations[name]
+            if state.current_animation == name:
+                state.current_animation = None
+            state.set_status(f"Deleted animation: {name}")
+
+    elif args.startswith('play '):
+        # Play specific animation
+        name = args[5:].strip()
+        if name not in state.animations:
+            state.set_status(f"Animation '{name}' not found")
+        elif not state.animations[name].frames:
+            state.set_status(f"Animation '{name}' has no frames")
+        else:
+            state.current_animation = name
+            toggle_animation_playback()
+
+    elif args == 'stop':
+        # Stop playing animation
+        if state.animation_playing:
+            state.animation_playing = False
+            state.set_status("Animation stopped")
+        else:
+            state.set_status("No animation playing")
+
+    elif args == 'list':
+        # List all animations
+        if state.animations:
+            names = ", ".join(sorted(state.animations.keys()))
+            state.set_status(f"Animations: {names}")
+        else:
+            state.set_status("No animations defined")
+
+    else:
+        # Try to select animation by name
+        if args in state.animations:
+            state.current_animation = args
+            state.set_status(f"Selected animation: {args}")
+        else:
+            state.set_status("Usage: :anim [new|delete|play|list] <name>")
+
+
 # ============================================================================
 # FILE I/O (Python Code Format)
 # ============================================================================
@@ -1875,6 +2452,23 @@ def generate_sprite_code(filename: str) -> str:
         lines.append("            },")
 
     lines.append("        ],")
+
+    # Add animations if any
+    if state.animations:
+        lines.append("        'animations': {")
+        for anim_name, anim in sorted(state.animations.items()):
+            # 3-tuple: (frame_index, offset_x, offset_y)
+            frames_repr = ', '.join(
+                f"({af.frame_index}, {af.offset_x}, {af.offset_y})"
+                for af in anim.frames
+            )
+            lines.append(f"            {repr(anim_name)}: {{")
+            lines.append(f"                'frames': [{frames_repr}],")
+            lines.append(f"                'frame_duration': {anim.frame_duration},")
+            lines.append(f"                'loop': {anim.loop},")
+            lines.append("            },")
+        lines.append("        },")
+
     lines.append("    },")
     lines.append("}")
     lines.append("")
@@ -2091,6 +2685,21 @@ def load_sprite_from_defs(path: str, sprite_defs: dict):
     if not state.frames:
         state.frames = [SpriteFrame()]
 
+    # Load animations
+    state.animations.clear()
+    if 'animations' in defn:
+        for anim_name, anim_data in defn['animations'].items():
+            anim_frames = [
+                AnimationFrame(frame_index=f[0], offset_x=f[1], offset_y=f[2])
+                for f in anim_data.get('frames', [])
+            ]
+            state.animations[anim_name] = AnimationDef(
+                name=anim_name,
+                frames=anim_frames,
+                frame_duration=anim_data.get('frame_duration', 0.2),
+                loop=anim_data.get('loop', True),
+            )
+
     # Load first frame into cells
     state.current_frame = 0
     state.cells = dict(state.frames[0].cells)
@@ -2101,7 +2710,8 @@ def load_sprite_from_defs(path: str, sprite_defs: dict):
     state.cursor_y = 0
 
     frame_info = f", {len(state.frames)} frames" if len(state.frames) > 1 else ""
-    state.set_status(f"Loaded sprite: {sprite_name} {state.canvas_width}x{state.canvas_height}{frame_info}")
+    anim_info = f", {len(state.animations)} anims" if state.animations else ""
+    state.set_status(f"Loaded sprite: {sprite_name} {state.canvas_width}x{state.canvas_height}{frame_info}{anim_info}")
 
 
 # ============================================================================
@@ -2115,6 +2725,45 @@ def update(dt: float):
     if state.cursor_blink_timer >= CURSOR_BLINK_RATE:
         state.cursor_blink_timer = 0
         state.cursor_visible = not state.cursor_visible
+
+    # In preview mode, use pyunicodegame's sprite animation system
+    if state.mode == EditorMode.ANIMATION_PREVIEW and root:
+        root.update_sprites(dt)
+        # Still decay status message
+        if state.status_message_time > 0:
+            state.status_message_time -= dt
+            if state.status_message_time <= 0:
+                state.status_message = ""
+        return  # Skip our own animation tick logic in preview mode
+
+    # Update animation playback
+    if state.animation_playing and len(state.frames) > 1:
+        # Determine frame duration
+        frame_duration = 0.2  # Default
+        if state.current_animation and state.current_animation in state.animations:
+            anim = state.animations[state.current_animation]
+            frame_duration = anim.frame_duration
+
+        state.animation_timer += dt
+        if state.animation_timer >= frame_duration:
+            state.animation_timer = 0
+
+            # Save current frame
+            state.frames[state.current_frame].cells = dict(state.cells)
+
+            # Advance to next frame
+            if state.current_animation and state.current_animation in state.animations:
+                # Use animation's frame sequence
+                anim = state.animations[state.current_animation]
+                state.animation_frame_idx = (state.animation_frame_idx + 1) % len(anim.frames)
+                anim_frame = anim.frames[state.animation_frame_idx]
+                state.current_frame = anim_frame.frame_index % len(state.frames)
+            else:
+                # Cycle through all frames
+                state.current_frame = (state.current_frame + 1) % len(state.frames)
+
+            # Load new frame
+            state.cells = dict(state.frames[state.current_frame].cells)
 
     # Decay status message
     if state.status_message_time > 0:
