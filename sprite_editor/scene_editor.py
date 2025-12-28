@@ -20,10 +20,11 @@ import pyunicodegame
 import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any
 import sys
 import re
 import random
+import os
 
 
 # ============================================================================
@@ -187,6 +188,8 @@ class EditorMode(Enum):
     HELP = auto()
     ANIMATION_EDITOR = auto()    # Animation assembly screen
     ANIMATION_PREVIEW = auto()   # Full-screen animation preview
+    SPRITE_LIBRARY = auto()      # Sprite library management (scene mode)
+    SPRITE_PICKER = auto()       # Sprite picker for placement (scene mode)
 
 
 @dataclass
@@ -257,6 +260,24 @@ class AnimationDef:
     frames: List['AnimationFrame'] = field(default_factory=list)  # Frames with offsets
     frame_duration: float = 0.2  # Seconds per frame
     loop: bool = True
+
+
+@dataclass
+class SpriteLibraryEntry:
+    """Reference to an external sprite definition file"""
+    file_path: str              # Path to .py sprite file (relative to scene)
+    sprite_names: List[str] = field(default_factory=list)  # Names within SPRITE_DEFS
+    sprite_defs: dict = field(default_factory=dict)  # Cached SPRITE_DEFS from file
+
+
+@dataclass
+class SpriteInstance:
+    """A placed sprite in the scene"""
+    library_key: str            # "path/to/file.py:sprite_name"
+    instance_id: str            # Unique ID (e.g., "hero_001")
+    x: int
+    y: int
+    initial_animation: Optional[str] = None
 
 
 @dataclass
@@ -390,6 +411,17 @@ class EditorState:
     anim_editor_frame_cursor: int = 0        # Selected frame within animation
     anim_editor_mode: str = "list"           # "list" or "edit"
 
+    # Scene mode state
+    sprite_library: Dict[str, SpriteLibraryEntry] = field(default_factory=dict)  # Loaded sprite files
+    sprite_instances: Dict[str, SpriteInstance] = field(default_factory=dict)    # Placed sprites in scene
+    scene_tool: str = "char"                        # "char" or "sprite"
+    selected_library_sprite: Optional[str] = None   # Current sprite to place (library_key)
+    sprite_library_cursor: int = 0                  # Cursor in library list
+    sprite_picker_cursor: int = 0                   # Cursor in sprite picker
+    instance_counter: int = 0                       # For generating unique instance IDs
+    scene_preview_sprites: Dict[str, Any] = field(default_factory=dict)  # pyunicodegame sprites for scene preview
+    help_page: int = 0                              # Current help page (0=general, 1=scene)
+
     def get_cell(self, x: int, y: int) -> Optional[Cell]:
         return self.cells.get((x, y))
 
@@ -442,6 +474,8 @@ MODE_DISPLAY = {
     EditorMode.HELP: ("-- HELP --", (255, 255, 255)),
     EditorMode.ANIMATION_EDITOR: ("-- ANIMATION --", (255, 150, 50)),
     EditorMode.ANIMATION_PREVIEW: ("-- PREVIEW --", (100, 255, 100)),
+    EditorMode.SPRITE_LIBRARY: ("-- LIBRARY --", (100, 200, 255)),
+    EditorMode.SPRITE_PICKER: ("-- SPRITES --", (255, 200, 100)),
 }
 
 
@@ -469,6 +503,12 @@ def render():
         return
     if state.mode == EditorMode.ANIMATION_PREVIEW:
         render_animation_preview()
+        return
+    if state.mode == EditorMode.SPRITE_LIBRARY:
+        render_sprite_library()
+        return
+    if state.mode == EditorMode.SPRITE_PICKER:
+        render_sprite_picker()
         return
 
     # Draw border/frame on root window around sprite area
@@ -537,6 +577,9 @@ def render_canvas():
             else:
                 # Underline-style cursor in normal mode
                 sprite_win.put(cx, cy, '▁', COLOR_CURSOR)
+
+    # Sprites are rendered by pyunicodegame via root.update_sprites()
+    # We don't need to manually render them here anymore
 
     # Draw selection highlight in VISUAL mode
     if state.mode == EditorMode.VISUAL and state.selection_start:
@@ -655,17 +698,24 @@ def render_status_bar():
         editor_mode_text = "SPRITE"
         editor_mode_color = (100, 200, 255)
     else:
-        editor_mode_text = "SCENE"
+        # Scene mode - show tool indicator
+        if state.scene_tool == "sprite":
+            tool_name = state.selected_library_sprite.split(':')[1] if state.selected_library_sprite else "?"
+            editor_mode_text = f"SCENE[{tool_name}]"
+        else:
+            editor_mode_text = "SCENE[char]"
         editor_mode_color = (200, 255, 100)
     status_win.put_string(0, status_row, editor_mode_text, editor_mode_color)
 
-    # Vim mode indicator
+    # Vim mode indicator - position after editor mode text
     mode_text, mode_color = MODE_DISPLAY[state.mode]
-    status_win.put_string(8, status_row, mode_text, mode_color)
+    mode_pos = len(editor_mode_text) + 1
+    status_win.put_string(mode_pos, status_row, mode_text, mode_color)
 
     # Position
     pos_text = f"{state.cursor_x},{state.cursor_y}"
-    status_win.put_string(22, status_row, pos_text, COLOR_STATUS_DIM)
+    pos_x = max(22, mode_pos + len(mode_text) + 1)
+    status_win.put_string(pos_x, status_row, pos_text, COLOR_STATUS_DIM)
 
     # Frame info (sprite mode only)
     if state.editor_mode == "sprite" and len(state.frames) > 1:
@@ -958,7 +1008,7 @@ def render_palette_codepoint():
 
 
 def render_help_overlay():
-    """Render full-screen help overlay"""
+    """Render full-screen help overlay with pagination"""
     # Hide other windows during help
     sprite_win.visible = False
     status_win.visible = False
@@ -968,67 +1018,106 @@ def render_help_overlay():
     heading_color = (255, 200, 100)
     key_color = (100, 255, 100)
     desc_color = (180, 180, 180)
+    dim_color = (100, 100, 120)
 
     # Background
     for y in range(h):
         for x in range(w):
             root.put(x, y, ' ', (30, 30, 40))
 
-    # Title
-    title = "SPRITE & SCENE EDITOR - HELP"
+    # Title with page indicator
+    total_pages = 2
+    page_num = state.help_page + 1
+    if state.help_page == 0:
+        title = "HELP - GENERAL"
+    else:
+        title = "HELP - SCENE MODE"
     root.put_string((w - len(title)) // 2, 1, title, title_color)
+
+    # Page indicator
+    page_ind = f"[{page_num}/{total_pages}]"
+    root.put_string(w - len(page_ind) - 1, 1, page_ind, dim_color)
+
     root.put_string(0, 2, "═" * w, (60, 60, 80))
 
-    # Left column: x=2-28, right column: x=31-58
-    # Keys at col+2, descriptions at col+12
+    if state.help_page == 0:
+        # PAGE 1: General controls (left column ends before 31)
+        y = 4
+        root.put_string(2, y, "NAVIGATION", heading_color); y += 1
+        root.put_string(4, y, "hjkl", key_color); root.put_string(12, y, "Move cursor", desc_color); y += 1
+        root.put_string(4, y, "0 / $", key_color); root.put_string(12, y, "Line start/end", desc_color); y += 1
+        root.put_string(4, y, "gg / G", key_color); root.put_string(12, y, "Top/bottom", desc_color); y += 2
 
-    y = 4
-    # Navigation
-    root.put_string(2, y, "NAVIGATION", heading_color); y += 1
-    root.put_string(4, y, "hjkl", key_color); root.put_string(14, y, "Move cursor", desc_color); y += 1
-    root.put_string(4, y, "0 / $", key_color); root.put_string(14, y, "Line start/end", desc_color); y += 1
-    root.put_string(4, y, "gg / G", key_color); root.put_string(14, y, "Top/bottom", desc_color); y += 2
+        root.put_string(2, y, "DRAWING", heading_color); y += 1
+        root.put_string(4, y, "Space", key_color); root.put_string(12, y, "Stamp char", desc_color); y += 1
+        root.put_string(4, y, "i", key_color); root.put_string(12, y, "Insert mode", desc_color); y += 1
+        root.put_string(4, y, "x", key_color); root.put_string(12, y, "Delete char", desc_color); y += 1
+        root.put_string(4, y, "c", key_color); root.put_string(12, y, "Pick char under", desc_color); y += 1
+        root.put_string(4, y, "f", key_color); root.put_string(12, y, "Cycle FG color", desc_color); y += 2
 
-    # Drawing
-    root.put_string(2, y, "DRAWING", heading_color); y += 1
-    root.put_string(4, y, "Space", key_color); root.put_string(14, y, "Stamp char", desc_color); y += 1
-    root.put_string(4, y, "i", key_color); root.put_string(14, y, "Insert mode", desc_color); y += 1
-    root.put_string(4, y, "x", key_color); root.put_string(14, y, "Delete char", desc_color); y += 1
-    root.put_string(4, y, "c", key_color); root.put_string(14, y, "Pick char", desc_color); y += 1
-    root.put_string(4, y, "f", key_color); root.put_string(14, y, "Cycle color", desc_color); y += 2
+        root.put_string(2, y, "ANIMATION", heading_color); y += 1
+        root.put_string(4, y, ", .", key_color); root.put_string(12, y, "Prev/next frame", desc_color); y += 1
+        root.put_string(4, y, "Tab", key_color); root.put_string(12, y, "Play/stop", desc_color); y += 1
 
-    # Palette - right column
-    y2 = 4
-    root.put_string(31, y2, "PALETTE (p)", heading_color); y2 += 1
-    root.put_string(33, y2, "j/k", key_color); root.put_string(44, y2, "Navigate cats", desc_color); y2 += 1
-    root.put_string(33, y2, "Enter", key_color); root.put_string(44, y2, "QWERTY picker", desc_color); y2 += 1
-    root.put_string(33, y2, "r", key_color); root.put_string(44, y2, "Random char", desc_color); y2 += 1
-    root.put_string(33, y2, "u", key_color); root.put_string(44, y2, "U+codepoint", desc_color); y2 += 2
+        # Right column starts at 31
+        y2 = 4
+        root.put_string(31, y2, "PALETTE (p)", heading_color); y2 += 1
+        root.put_string(33, y2, "j/k", key_color); root.put_string(41, y2, "Navigate", desc_color); y2 += 1
+        root.put_string(33, y2, "Enter", key_color); root.put_string(41, y2, "QWERTY mode", desc_color); y2 += 1
+        root.put_string(33, y2, "r", key_color); root.put_string(41, y2, "Random char", desc_color); y2 += 1
+        root.put_string(33, y2, "u", key_color); root.put_string(41, y2, "Codepoint", desc_color); y2 += 2
 
-    # Visual mode
-    root.put_string(31, y2, "VISUAL MODE", heading_color); y2 += 1
-    root.put_string(33, y2, "v", key_color); root.put_string(44, y2, "Start select", desc_color); y2 += 1
-    root.put_string(33, y2, "y", key_color); root.put_string(44, y2, "Yank (copy)", desc_color); y2 += 1
-    root.put_string(33, y2, "d", key_color); root.put_string(44, y2, "Delete", desc_color); y2 += 1
-    root.put_string(33, y2, "r", key_color); root.put_string(44, y2, "Fill with char", desc_color); y2 += 1
-    root.put_string(33, y2, "P", key_color); root.put_string(44, y2, "Paste yanked", desc_color); y2 += 2
+        root.put_string(31, y2, "VISUAL MODE (v)", heading_color); y2 += 1
+        root.put_string(33, y2, "y", key_color); root.put_string(41, y2, "Yank", desc_color); y2 += 1
+        root.put_string(33, y2, "d", key_color); root.put_string(41, y2, "Delete", desc_color); y2 += 1
+        root.put_string(33, y2, "r", key_color); root.put_string(41, y2, "Fill", desc_color); y2 += 1
+        root.put_string(33, y2, "P", key_color); root.put_string(41, y2, "Paste", desc_color); y2 += 2
 
-    # Commands
-    root.put_string(31, y2, "COMMANDS", heading_color); y2 += 1
-    root.put_string(33, y2, ":sprite N WxH", key_color); root.put_string(48, y2, "New sprite", desc_color); y2 += 1
-    root.put_string(33, y2, ":w file", key_color); root.put_string(48, y2, "Save", desc_color); y2 += 1
-    root.put_string(33, y2, ":q :wq", key_color); root.put_string(48, y2, "Quit", desc_color); y2 += 1
-    root.put_string(33, y2, ":frame", key_color); root.put_string(48, y2, "Add frame", desc_color); y2 += 1
-    root.put_string(33, y2, ":anim", key_color); root.put_string(48, y2, "Animation editor", desc_color); y2 += 1
+        root.put_string(31, y2, "COMMANDS", heading_color); y2 += 1
+        root.put_string(33, y2, ":sprite", key_color); root.put_string(42, y2, "New sprite", desc_color); y2 += 1
+        root.put_string(33, y2, ":w :q", key_color); root.put_string(42, y2, "Save/quit", desc_color); y2 += 1
+        root.put_string(33, y2, ":frame", key_color); root.put_string(42, y2, "Add frame", desc_color); y2 += 1
+        root.put_string(33, y2, ":anim", key_color); root.put_string(42, y2, "Anim editor", desc_color); y2 += 1
 
-    # Animation (continued in left column)
-    root.put_string(2, y, "ANIMATION", heading_color); y += 1
-    root.put_string(4, y, ", .", key_color); root.put_string(14, y, "Prev/next frame", desc_color); y += 1
-    root.put_string(4, y, "Tab", key_color); root.put_string(14, y, "Play/stop anim", desc_color); y += 1
+    else:
+        # PAGE 2: Scene mode (left column ends before 31)
+        y = 4
+        root.put_string(2, y, "SCENE KEYS", heading_color); y += 1
+        root.put_string(4, y, "t", key_color); root.put_string(12, y, "Toggle tool", desc_color); y += 1
+        root.put_string(4, y, "S", key_color); root.put_string(12, y, "Sprite picker", desc_color); y += 1
+        root.put_string(4, y, "I", key_color); root.put_string(12, y, "Library mgr", desc_color); y += 1
+        root.put_string(4, y, "D", key_color); root.put_string(12, y, "Delete sprite", desc_color); y += 1
+        root.put_string(4, y, "a", key_color); root.put_string(12, y, "Cycle anim", desc_color); y += 1
+        root.put_string(4, y, "Space", key_color); root.put_string(12, y, "Place", desc_color); y += 2
+
+        root.put_string(2, y, "SCENE COMMANDS", heading_color); y += 1
+        root.put_string(4, y, ":scene WxH", key_color); y += 1
+        root.put_string(4, y, ":import path", key_color); y += 1
+        root.put_string(4, y, ":unimport path", key_color); y += 1
+        root.put_string(4, y, ":library", key_color); y += 1
+        root.put_string(4, y, ":tool char|sprite", key_color); y += 1
+
+        # Right column starts at 31
+        y2 = 4
+        root.put_string(31, y2, "SPRITE PICKER", heading_color); y2 += 1
+        root.put_string(33, y2, "hjkl", key_color); root.put_string(41, y2, "Navigate", desc_color); y2 += 1
+        root.put_string(33, y2, "Enter", key_color); root.put_string(41, y2, "Select", desc_color); y2 += 1
+        root.put_string(33, y2, "Esc", key_color); root.put_string(41, y2, "Cancel", desc_color); y2 += 2
+
+        root.put_string(31, y2, "LIBRARY MANAGER", heading_color); y2 += 1
+        root.put_string(33, y2, "j/k", key_color); root.put_string(41, y2, "Navigate", desc_color); y2 += 1
+        root.put_string(33, y2, "d", key_color); root.put_string(41, y2, "Unload", desc_color); y2 += 1
+        root.put_string(33, y2, "Esc", key_color); root.put_string(41, y2, "Close", desc_color); y2 += 2
+
+        root.put_string(31, y2, "WORKFLOW", heading_color); y2 += 1
+        root.put_string(33, y2, "1.", dim_color); root.put_string(36, y2, ":scene 40x30", desc_color); y2 += 1
+        root.put_string(33, y2, "2.", dim_color); root.put_string(36, y2, ":import file.py", desc_color); y2 += 1
+        root.put_string(33, y2, "3.", dim_color); root.put_string(36, y2, "S pick, Space", desc_color); y2 += 1
+        root.put_string(33, y2, "4.", dim_color); root.put_string(36, y2, ":w level.py", desc_color); y2 += 1
 
     # Footer
     root.put_string(0, h - 2, "═" * w, (60, 60, 80))
-    footer = "Press any key to close"
+    footer = "←/→ or h/l: switch page  |  Esc/Enter: close"
     root.put_string((w - len(footer)) // 2, h - 1, footer, (150, 150, 150))
 
 
@@ -1110,7 +1199,7 @@ def render_animation_editor():
 
             root.put_string(2, 4, f"EDITING: {anim_name}", heading_color)
             # Show duration and loop status
-            root.put_string(25, 4, f"Duration: {anim.frame_duration:.2f}s", normal_color)
+            root.put_string(25, 4, f"{anim.frame_duration:.2f}s/frame", normal_color)
             root.put_string(45, 4, f"Loop: {'ON' if anim.loop else 'OFF'}", selected_color if anim.loop else dim_color)
             root.put_string(2, 5, "─" * 56, dim_color)
 
@@ -1235,6 +1324,148 @@ def render_animation_preview():
     root.put_string((w - len(help_text)) // 2, h - 1, help_text, (100, 100, 120))
 
 
+def render_sprite_library():
+    """Render full-screen sprite library manager"""
+    sprite_win.visible = False
+    status_win.visible = False
+
+    w, h = ROOT_WIDTH, ROOT_HEIGHT
+    title_color = (100, 200, 255)
+    heading_color = (150, 220, 255)
+    selected_color = (100, 255, 100)
+    normal_color = (180, 180, 180)
+    dim_color = (100, 100, 120)
+
+    # Background
+    for y in range(h):
+        for x in range(w):
+            root.put(x, y, ' ', (25, 30, 40))
+
+    # Title
+    title = "SPRITE LIBRARY"
+    root.put_string((w - len(title)) // 2, 1, title, title_color)
+    root.put_string(0, 2, "═" * w, (60, 60, 80))
+
+    # Get list of loaded libraries
+    lib_paths = sorted(state.sprite_library.keys())
+
+    if not lib_paths:
+        root.put_string(2, 5, "(no sprite files loaded)", dim_color)
+        root.put_string(2, 7, "Use :import <file.py> to load sprites", dim_color)
+    else:
+        root.put_string(2, 4, "LOADED FILES", heading_color)
+        root.put_string(2, 5, "─" * 40, dim_color)
+
+        y = 7
+        for i, lib_path in enumerate(lib_paths):
+            if y >= h - 5:
+                break
+
+            entry = state.sprite_library[lib_path]
+            is_selected = i == state.sprite_library_cursor
+            color = selected_color if is_selected else normal_color
+            prefix = ">" if is_selected else " "
+
+            root.put_string(2, y, f"{prefix} {lib_path}", color)
+            y += 1
+
+            # Show sprite names in this library
+            for sprite_name in entry.sprite_names[:5]:  # Limit display
+                if y >= h - 5:
+                    break
+                sprite_def = entry.sprite_defs.get(sprite_name, {})
+                sw = sprite_def.get('width', '?')
+                sh = sprite_def.get('height', '?')
+                nf = len(sprite_def.get('frames', []))
+                root.put_string(6, y, f"• {sprite_name} ({sw}x{sh}, {nf}f)", dim_color)
+                y += 1
+
+            if len(entry.sprite_names) > 5:
+                root.put_string(6, y, f"  ... and {len(entry.sprite_names) - 5} more", dim_color)
+                y += 1
+
+            y += 1  # Spacing between libraries
+
+    # Controls at bottom
+    root.put_string(0, h - 4, "═" * w, (60, 60, 80))
+    root.put_string(2, h - 3, "j/k:Navigate  d:Unload  n:Import new  Esc:Close", dim_color)
+    root.put_string(2, h - 2, f"Loaded: {len(lib_paths)} files, {len(get_all_library_sprites())} sprites", dim_color)
+
+
+def render_sprite_picker():
+    """Render sprite picker grid for placement"""
+    sprite_win.visible = False
+    status_win.visible = False
+
+    w, h = ROOT_WIDTH, ROOT_HEIGHT
+    title_color = (255, 200, 100)
+    selected_color = (100, 255, 100)
+    normal_color = (180, 180, 180)
+    dim_color = (100, 100, 120)
+
+    # Background
+    for y in range(h):
+        for x in range(w):
+            root.put(x, y, ' ', (30, 30, 35))
+
+    # Title
+    title = "SELECT SPRITE"
+    root.put_string((w - len(title)) // 2, 1, title, title_color)
+    root.put_string(0, 2, "═" * w, (60, 60, 80))
+
+    # Get all sprites
+    all_sprites = get_all_library_sprites()
+
+    if not all_sprites:
+        root.put_string(2, 5, "(no sprites available)", dim_color)
+        root.put_string(2, 7, "Use :import <file.py> to load sprites", dim_color)
+    else:
+        # Display as a grid
+        cols = 4
+        cell_width = 14
+        start_y = 4
+
+        for i, (library_key, sprite_name, sprite_def) in enumerate(all_sprites):
+            if start_y + (i // cols) * 4 >= h - 5:
+                break
+
+            col = i % cols
+            row = i // cols
+            x = 2 + col * cell_width
+            y = start_y + row * 4
+
+            is_selected = i == state.sprite_picker_cursor
+            color = selected_color if is_selected else normal_color
+
+            # Draw selection box
+            if is_selected:
+                root.put_string(x, y, "┌" + "─" * 10 + "┐", selected_color)
+                root.put_string(x, y + 2, "└" + "─" * 10 + "┘", selected_color)
+                root.put(x, y + 1, "│", selected_color)
+                root.put(x + 11, y + 1, "│", selected_color)
+
+            # Show first char of sprite as preview
+            first_frame = sprite_def.get('frames', [{}])[0]
+            chars = first_frame.get('chars', [[]])
+            if chars and chars[0]:
+                preview_char = chars[0][0] if chars[0][0] != ' ' else '?'
+            else:
+                preview_char = '?'
+
+            root.put(x + 5, y + 1, preview_char, color)
+
+            # Sprite name (truncated)
+            name_display = sprite_name[:10]
+            root.put_string(x + 1, y + 3, name_display, dim_color if not is_selected else normal_color)
+
+    # Controls at bottom
+    root.put_string(0, h - 4, "═" * w, (60, 60, 80))
+    root.put_string(2, h - 3, "hjkl:Navigate  Enter:Select  Esc:Cancel", dim_color)
+    if all_sprites and 0 <= state.sprite_picker_cursor < len(all_sprites):
+        lib_key, name, _ = all_sprites[state.sprite_picker_cursor]
+        root.put_string(2, h - 2, f"Selected: {name} from {lib_key.split(':')[0]}", normal_color)
+
+
 # ============================================================================
 # INPUT HANDLING
 # ============================================================================
@@ -1242,8 +1473,16 @@ def render_animation_preview():
 def on_key(key):
     """Handle keyboard input based on current mode"""
     if state.mode == EditorMode.HELP:
-        # Any key closes help
+        # Page navigation in help
+        if key in (pygame.K_LEFT, pygame.K_h):
+            state.help_page = max(0, state.help_page - 1)
+            return
+        elif key in (pygame.K_RIGHT, pygame.K_l):
+            state.help_page = min(1, state.help_page + 1)
+            return
+        # Close help on Esc, Enter, or other keys
         state.mode = EditorMode.NORMAL
+        state.help_page = 0  # Reset to first page
         sprite_win.visible = True
         status_win.visible = True
         return
@@ -1265,6 +1504,83 @@ def on_key(key):
         handle_animation_editor(key)
     elif state.mode == EditorMode.ANIMATION_PREVIEW:
         handle_animation_preview(key)
+    elif state.mode == EditorMode.SPRITE_LIBRARY:
+        handle_sprite_library(key)
+    elif state.mode == EditorMode.SPRITE_PICKER:
+        handle_sprite_picker(key)
+
+
+def handle_sprite_library(key):
+    """Handle keys in sprite library mode"""
+    lib_paths = sorted(state.sprite_library.keys())
+
+    if is_escape(key):
+        state.mode = EditorMode.NORMAL
+        sprite_win.visible = True
+        status_win.visible = True
+        return
+
+    if key in (pygame.K_j, pygame.K_DOWN):
+        if lib_paths:
+            state.sprite_library_cursor = (state.sprite_library_cursor + 1) % len(lib_paths)
+
+    elif key in (pygame.K_k, pygame.K_UP):
+        if lib_paths:
+            state.sprite_library_cursor = (state.sprite_library_cursor - 1) % len(lib_paths)
+
+    elif key == pygame.K_d:
+        # Unload selected library
+        if lib_paths and 0 <= state.sprite_library_cursor < len(lib_paths):
+            lib_path = lib_paths[state.sprite_library_cursor]
+            unload_sprite_library(lib_path)
+            if state.sprite_library_cursor >= len(state.sprite_library):
+                state.sprite_library_cursor = max(0, len(state.sprite_library) - 1)
+
+    elif key == pygame.K_n:
+        # Switch to command mode to import
+        state.mode = EditorMode.COMMAND
+        state.command_buffer = "import "
+        sprite_win.visible = True
+        status_win.visible = True
+
+
+def handle_sprite_picker(key):
+    """Handle keys in sprite picker mode"""
+    all_sprites = get_all_library_sprites()
+    cols = 4
+
+    if is_escape(key):
+        state.mode = EditorMode.NORMAL
+        sprite_win.visible = True
+        status_win.visible = True
+        return
+
+    if key in (pygame.K_j, pygame.K_DOWN):
+        if all_sprites:
+            state.sprite_picker_cursor = min(len(all_sprites) - 1, state.sprite_picker_cursor + cols)
+
+    elif key in (pygame.K_k, pygame.K_UP):
+        if all_sprites:
+            state.sprite_picker_cursor = max(0, state.sprite_picker_cursor - cols)
+
+    elif key in (pygame.K_h, pygame.K_LEFT):
+        if all_sprites:
+            state.sprite_picker_cursor = max(0, state.sprite_picker_cursor - 1)
+
+    elif key in (pygame.K_l, pygame.K_RIGHT):
+        if all_sprites:
+            state.sprite_picker_cursor = min(len(all_sprites) - 1, state.sprite_picker_cursor + 1)
+
+    elif key == pygame.K_RETURN:
+        # Select sprite
+        if all_sprites and 0 <= state.sprite_picker_cursor < len(all_sprites):
+            library_key, sprite_name, _ = all_sprites[state.sprite_picker_cursor]
+            state.selected_library_sprite = library_key
+            state.scene_tool = "sprite"
+            state.mode = EditorMode.NORMAL
+            sprite_win.visible = True
+            status_win.visible = True
+            state.set_status(f"Selected: {sprite_name}")
 
 
 def handle_animation_preview(key):
@@ -1355,6 +1671,7 @@ def handle_animation_editor(key):
                 # Shift+J: Decrease Y offset (move down visually)
                 if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
                     anim.frames[state.anim_editor_frame_cursor].offset_y += 1
+                    state.modified = True
             else:
                 # Navigate down in frame list
                 if anim.frames:
@@ -1365,6 +1682,7 @@ def handle_animation_editor(key):
                 # Shift+K: Increase Y offset (move up visually)
                 if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
                     anim.frames[state.anim_editor_frame_cursor].offset_y -= 1
+                    state.modified = True
             else:
                 # Navigate up in frame list
                 if anim.frames:
@@ -1374,21 +1692,25 @@ def handle_animation_editor(key):
             # Decrease X offset
             if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
                 anim.frames[state.anim_editor_frame_cursor].offset_x -= 1
+                state.modified = True
 
         elif key == pygame.K_l:
             if pygame.key.get_mods() & pygame.KMOD_SHIFT:
                 # Shift+L: Toggle loop
                 anim.loop = not anim.loop
+                state.modified = True
                 state.set_status(f"Loop: {'On' if anim.loop else 'Off'}")
             else:
                 # Increase X offset
                 if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
                     anim.frames[state.anim_editor_frame_cursor].offset_x += 1
+                    state.modified = True
 
         elif key == pygame.K_a:
             # Add current sprite frame to animation
             anim.frames.append(AnimationFrame(frame_index=state.current_frame))
             state.anim_editor_frame_cursor = len(anim.frames) - 1
+            state.modified = True
             state.set_status(f"Added frame {state.current_frame + 1}")
 
         elif key == pygame.K_d:
@@ -1396,6 +1718,7 @@ def handle_animation_editor(key):
             if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
                 del anim.frames[state.anim_editor_frame_cursor]
                 state.anim_editor_frame_cursor = max(0, min(state.anim_editor_frame_cursor, len(anim.frames) - 1))
+                state.modified = True
                 state.set_status("Frame removed")
 
         elif key == pygame.K_LEFTBRACKET:
@@ -1404,6 +1727,7 @@ def handle_animation_editor(key):
                 i = state.anim_editor_frame_cursor
                 anim.frames[i], anim.frames[i-1] = anim.frames[i-1], anim.frames[i]
                 state.anim_editor_frame_cursor -= 1
+                state.modified = True
 
         elif key == pygame.K_RIGHTBRACKET:
             # Move frame later in sequence
@@ -1411,23 +1735,27 @@ def handle_animation_editor(key):
                 i = state.anim_editor_frame_cursor
                 anim.frames[i], anim.frames[i+1] = anim.frames[i+1], anim.frames[i]
                 state.anim_editor_frame_cursor += 1
+                state.modified = True
 
         elif key == pygame.K_0:
             # Reset offset to (0, 0)
             if anim.frames and 0 <= state.anim_editor_frame_cursor < len(anim.frames):
                 anim.frames[state.anim_editor_frame_cursor].offset_x = 0
                 anim.frames[state.anim_editor_frame_cursor].offset_y = 0
+                state.modified = True
                 state.set_status("Offset reset")
 
         elif key == pygame.K_EQUALS:
             # Increase animation duration
             anim.frame_duration = min(5.0, anim.frame_duration + 0.05)
-            state.set_status(f"Duration: {anim.frame_duration:.2f}s")
+            state.modified = True
+            state.set_status(f"Duration: {anim.frame_duration:.2f}s/frame")
 
         elif key == pygame.K_MINUS:
             # Decrease animation duration
             anim.frame_duration = max(0.02, anim.frame_duration - 0.05)
-            state.set_status(f"Duration: {anim.frame_duration:.2f}s")
+            state.modified = True
+            state.set_status(f"Duration: {anim.frame_duration:.2f}s/frame")
 
         elif key == pygame.K_SPACE:
             # Preview animation in dedicated preview mode
@@ -1588,21 +1916,68 @@ def handle_normal_mode(key):
             state.set_status(f"Selected: {char}")
 
     elif key == pygame.K_SPACE:
-        # Stamp current character at cursor
-        cell = Cell(char=state.current_char, fg=state.current_fg, bg=state.current_bg)
-        state.set_cell(state.cursor_x, state.cursor_y, cell)
-        # Add to recent chars
-        if state.current_char in state.recent_chars:
-            state.recent_chars.remove(state.current_char)
-        state.recent_chars.insert(0, state.current_char)
-        state.recent_chars = state.recent_chars[:40]
-        # Move cursor by 2 for wide characters, 1 otherwise
-        state.cursor_x += 2 if is_wide_char(state.current_char) else 1
-        state.clamp_cursor()
+        if state.editor_mode == "scene" and state.scene_tool == "sprite":
+            # Place sprite instance
+            place_sprite_at_cursor()
+        else:
+            # Stamp current character at cursor
+            cell = Cell(char=state.current_char, fg=state.current_fg, bg=state.current_bg)
+            state.set_cell(state.cursor_x, state.cursor_y, cell)
+            # Add to recent chars
+            if state.current_char in state.recent_chars:
+                state.recent_chars.remove(state.current_char)
+            state.recent_chars.insert(0, state.current_char)
+            state.recent_chars = state.recent_chars[:40]
+            # Move cursor by 2 for wide characters, 1 otherwise
+            state.cursor_x += 2 if is_wide_char(state.current_char) else 1
+            state.clamp_cursor()
 
     elif key == pygame.K_SLASH and pygame.key.get_mods() & pygame.KMOD_SHIFT:
         # ? = open help
         state.mode = EditorMode.HELP
+
+    # Scene mode keybindings
+    elif key == pygame.K_t and state.editor_mode == "scene":
+        # t = toggle tool (char/sprite)
+        if state.scene_tool == "char":
+            state.scene_tool = "sprite"
+            if state.selected_library_sprite:
+                sprite_name = state.selected_library_sprite.split(':')[-1]
+                state.set_status(f"Tool: Sprite ({sprite_name})")
+            else:
+                state.set_status("Tool: Sprite (none selected - press S)")
+        else:
+            state.scene_tool = "char"
+            state.set_status("Tool: Character")
+
+    elif key == pygame.K_s and pygame.key.get_mods() & pygame.KMOD_SHIFT and state.editor_mode == "scene":
+        # S = open sprite picker
+        if not state.sprite_library:
+            state.set_status("No sprites loaded - use :import <file.py>")
+        else:
+            state.mode = EditorMode.SPRITE_PICKER
+            state.sprite_picker_cursor = 0
+            sprite_win.visible = False
+            status_win.visible = False
+
+    elif key == pygame.K_i and pygame.key.get_mods() & pygame.KMOD_SHIFT and state.editor_mode == "scene":
+        # I = open library manager
+        state.mode = EditorMode.SPRITE_LIBRARY
+        state.sprite_library_cursor = 0
+        sprite_win.visible = False
+        status_win.visible = False
+
+    elif key == pygame.K_d and pygame.key.get_mods() & pygame.KMOD_SHIFT and state.editor_mode == "scene":
+        # D = delete sprite under cursor
+        delete_sprite_at_cursor()
+
+    elif key == pygame.K_a and state.editor_mode == "scene":
+        # a = cycle animation on sprite under cursor
+        sprite = get_sprite_at_cursor()
+        if sprite:
+            cycle_sprite_animation(sprite)
+        else:
+            state.set_status("No sprite at cursor")
 
     # File operations
     elif key == pygame.K_s and pygame.key.get_mods() & pygame.KMOD_CTRL:
@@ -2129,14 +2504,14 @@ def execute_command(cmd: str):
         else:
             create_sprite(args)
 
-    elif command == 'frame':
+    elif command in ('frame', 'f'):
         handle_frame_command(args)
 
     elif command == 'frames':
         # List all frames
         state.set_status(f"Frames: {len(state.frames)} (current: {state.current_frame + 1})")
 
-    elif command in ('anim', 'animation'):
+    elif command in ('anim', 'animation', 'a'):
         handle_anim_command(args)
 
     elif command == 'set':
@@ -2147,6 +2522,49 @@ def execute_command(cmd: str):
 
     elif command == 'help':
         state.mode = EditorMode.HELP
+
+    elif command == 'scene':
+        if state.modified and not force:
+            state.set_status("Unsaved changes! Use :scene! to force")
+        else:
+            create_scene(args)
+
+    elif command in ('import', 'i'):
+        if not args:
+            state.set_status("Usage: :import <sprite_file.py>")
+        else:
+            load_sprite_library(args)
+
+    elif command == 'unimport':
+        if not args:
+            state.set_status("Usage: :unimport <sprite_file.py>")
+        else:
+            unload_sprite_library(args)
+
+    elif command == 'library':
+        if state.editor_mode != "scene":
+            state.set_status("Library only available in scene mode")
+        else:
+            state.mode = EditorMode.SPRITE_LIBRARY
+            sprite_win.visible = False
+            status_win.visible = False
+
+    elif command == 'tool':
+        if state.editor_mode != "scene":
+            state.set_status("Tool command only available in scene mode")
+        elif args in ('char', 'character'):
+            state.scene_tool = "char"
+            state.set_status("Tool: Character")
+        elif args in ('sprite', 'sprites'):
+            state.scene_tool = "sprite"
+            if not state.sprite_library:
+                state.set_status("Tool: Sprite (no library loaded - use :import)")
+            elif not state.selected_library_sprite:
+                state.set_status("Tool: Sprite (press S to select)")
+            else:
+                state.set_status(f"Tool: Sprite ({state.selected_library_sprite})")
+        else:
+            state.set_status("Usage: :tool char|sprite")
 
     elif command.isdigit():
         # Go to line
@@ -2272,6 +2690,48 @@ def create_sprite(args: str):
     state.set_status(f"New sprite '{name}' {width}x{height}")
 
 
+def create_scene(args: str):
+    """Create a new scene with :scene WxH"""
+    # Default to full root dimensions
+    width, height = ROOT_WIDTH, ROOT_HEIGHT - STATUS_HEIGHT
+
+    if args:
+        match = re.match(r'(\d+)x(\d+)', args.lower())
+        if match:
+            width = int(match.group(1))
+            height = int(match.group(2))
+
+    # Clamp dimensions
+    width = max(10, min(200, width))
+    height = max(10, min(100, height))
+
+    # Reset state for new scene
+    state.editor_mode = "scene"
+    state.sprite_name = ""
+    state.cells.clear()
+    state.frames = [SpriteFrame()]  # Single frame for scene
+    state.current_frame = 0
+    state.canvas_width = width
+    state.canvas_height = height
+    state.cursor_x = 0
+    state.cursor_y = 0
+    state.file_path = None
+    state.modified = False
+    state.current_fg = DEFAULT_FG
+
+    # Clear scene-specific state
+    state.sprite_library.clear()
+    state.sprite_instances.clear()
+    state.scene_tool = "char"
+    state.selected_library_sprite = None
+    state.instance_counter = 0
+
+    # Recreate sprite window with new dimensions
+    setup_sprite_window()
+
+    state.set_status(f"New scene {width}x{height}")
+
+
 def handle_frame_command(args: str):
     """Handle :frame command for animation frames"""
     args = args.strip()
@@ -2382,21 +2842,363 @@ def handle_anim_command(args: str):
 
 
 # ============================================================================
+# SPRITE LIBRARY (Scene Mode)
+# ============================================================================
+
+def load_sprite_library(path: str, base_dir: Optional[str] = None) -> bool:
+    """Load a sprite definition file into the library.
+
+    Args:
+        path: Path to the .py sprite file (can be relative, .py extension optional)
+        base_dir: Base directory for resolving relative paths (defaults to cwd)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    # Add .py extension if missing
+    if not path.endswith('.py'):
+        path = path + '.py'
+
+    # Resolve path
+    if base_dir and not os.path.isabs(path):
+        full_path = os.path.join(base_dir, path)
+    else:
+        full_path = os.path.abspath(path)
+
+    # Try generated_files/ if not found
+    if not os.path.exists(full_path) and not os.path.isabs(path):
+        gen_path = os.path.join(GENERATED_DIR, path)
+        if os.path.exists(gen_path):
+            full_path = os.path.abspath(gen_path)
+
+    # Store relative path for portability
+    if state.file_path:
+        scene_dir = os.path.dirname(os.path.abspath(state.file_path))
+        try:
+            rel_path = os.path.relpath(full_path, scene_dir)
+        except ValueError:
+            rel_path = full_path  # Different drives on Windows
+    else:
+        rel_path = path
+
+    try:
+        with open(full_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Execute the file to extract SPRITE_DEFS
+        # Include pyunicodegame and pygame in namespace since sprite files import them
+        namespace = {'pyunicodegame': pyunicodegame, 'pygame': pygame}
+        exec(content, namespace)
+
+        if 'SPRITE_DEFS' not in namespace:
+            state.set_status(f"No SPRITE_DEFS in {path}")
+            return False
+
+        sprite_defs = namespace['SPRITE_DEFS']
+        sprite_names = list(sprite_defs.keys())
+
+        # Create library entry
+        entry = SpriteLibraryEntry(
+            file_path=rel_path,
+            sprite_names=sprite_names,
+            sprite_defs=sprite_defs
+        )
+
+        state.sprite_library[rel_path] = entry
+        state.set_status(f"Imported: {rel_path} ({len(sprite_names)} sprites)")
+        return True
+
+    except FileNotFoundError:
+        state.set_status(f"File not found: {path}")
+        return False
+    except Exception as e:
+        state.set_status(f"Error loading {path}: {e}")
+        return False
+
+
+def unload_sprite_library(path: str):
+    """Remove a sprite library from the loaded set."""
+    if path in state.sprite_library:
+        # Remove any instances using sprites from this library
+        to_remove = [
+            inst_id for inst_id, inst in state.sprite_instances.items()
+            if inst.library_key.startswith(path + ":")
+        ]
+        for inst_id in to_remove:
+            del state.sprite_instances[inst_id]
+
+        del state.sprite_library[path]
+        state.set_status(f"Unloaded: {path}")
+    else:
+        state.set_status(f"Library not loaded: {path}")
+
+
+def get_all_library_sprites() -> List[Tuple[str, str, dict]]:
+    """Get all sprites from all loaded libraries.
+
+    Returns:
+        List of (library_key, sprite_name, sprite_def) tuples
+    """
+    result = []
+    for lib_path, entry in state.sprite_library.items():
+        for sprite_name in entry.sprite_names:
+            library_key = f"{lib_path}:{sprite_name}"
+            sprite_def = entry.sprite_defs[sprite_name]
+            result.append((library_key, sprite_name, sprite_def))
+    return result
+
+
+def create_scene_sprite(sprite_def: dict, x: int, y: int, initial_animation: Optional[str] = None):
+    """Create a pyunicodegame sprite from a library sprite definition."""
+    frames_data = sprite_def.get('frames', [{}])
+    default_fg = tuple(sprite_def.get('default_fg', (255, 255, 255)))
+    animations_data = sprite_def.get('animations', {})
+
+    # Build pyunicodegame frames
+    pug_frames = []
+    for frame_data in frames_data:
+        if 'chars' in frame_data:
+            # 2D array format
+            chars = frame_data.get('chars', [[]])
+            fg_colors = frame_data.get('fg_colors', [[]])
+            pug_frame = pyunicodegame.SpriteFrame(chars, fg_colors)
+        else:
+            # Empty frame
+            pug_frame = pyunicodegame.SpriteFrame([[' ']], [[None]])
+        pug_frames.append(pug_frame)
+
+    if not pug_frames:
+        pug_frames = [pyunicodegame.SpriteFrame([[' ']], [[None]])]
+
+    # Create the sprite
+    sprite = pyunicodegame.Sprite(pug_frames, fg=default_fg)
+    sprite.x = x
+    sprite.y = y
+
+    # Add animations
+    for anim_name, anim_data in animations_data.items():
+        anim_frames = anim_data.get('frames', [])
+        if not anim_frames:
+            continue
+
+        frame_indices = [f[0] for f in anim_frames]
+        offsets = [(float(f[1]), float(f[2])) for f in anim_frames]
+        frame_duration = anim_data.get('frame_duration', 0.2)
+        loop = anim_data.get('loop', True)
+
+        pug_anim = pyunicodegame.Animation(
+            name=anim_name,
+            frame_indices=frame_indices,
+            frame_duration=frame_duration,
+            offsets=offsets,
+            loop=loop,
+            offset_speed=50.0
+        )
+        sprite.add_animation(pug_anim)
+
+    # Start initial animation
+    if initial_animation and initial_animation in animations_data:
+        sprite.play_animation(initial_animation)
+    elif animations_data:
+        # Default to 'idle' or first animation
+        default_anim = 'idle' if 'idle' in animations_data else next(iter(animations_data))
+        sprite.play_animation(default_anim)
+
+    return sprite
+
+
+def get_canvas_offset():
+    """Get the (x, y) offset where the canvas is positioned on root."""
+    avail_h = ROOT_HEIGHT - STATUS_HEIGHT
+    sx = (ROOT_WIDTH - state.canvas_width) // 2
+    sy = (avail_h - state.canvas_height) // 2
+    return sx, sy
+
+
+def add_scene_preview_sprite(instance_id: str, instance: SpriteInstance):
+    """Create and add a preview sprite for a placed instance."""
+    lib_path = instance.library_key.split(':')[0]
+    sprite_name = instance.library_key.split(':')[1]
+
+    if lib_path not in state.sprite_library:
+        return
+
+    sprite_def = state.sprite_library[lib_path].sprite_defs.get(sprite_name, {})
+    if not sprite_def:
+        return
+
+    # Create the pyunicodegame sprite at canvas-relative position
+    sprite = create_scene_sprite(sprite_def, instance.x, instance.y, instance.initial_animation)
+
+    # Add to sprite window (not root)
+    if sprite_win:
+        sprite_win.add_sprite(sprite)
+
+    state.scene_preview_sprites[instance_id] = sprite
+
+
+def remove_scene_preview_sprite(instance_id: str):
+    """Remove a preview sprite from the scene."""
+    if instance_id in state.scene_preview_sprites:
+        sprite = state.scene_preview_sprites[instance_id]
+        if sprite_win:
+            sprite_win.remove_sprite(sprite)
+        del state.scene_preview_sprites[instance_id]
+
+
+def refresh_all_scene_sprites():
+    """Recreate all scene preview sprites (e.g., after loading a scene)."""
+    # Remove existing preview sprites
+    for instance_id in list(state.scene_preview_sprites.keys()):
+        remove_scene_preview_sprite(instance_id)
+
+    # Create new ones for all instances
+    for instance_id, instance in state.sprite_instances.items():
+        add_scene_preview_sprite(instance_id, instance)
+
+
+def place_sprite_at_cursor():
+    """Place a sprite instance at the cursor position"""
+    if not state.selected_library_sprite:
+        state.set_status("No sprite selected - press S to select")
+        return
+
+    library_key = state.selected_library_sprite
+    lib_path = library_key.split(':')[0]
+    sprite_name = library_key.split(':')[1]
+
+    # Check library is still loaded
+    if lib_path not in state.sprite_library:
+        state.set_status(f"Sprite library unloaded: {lib_path}")
+        state.selected_library_sprite = None
+        return
+
+    # Generate unique instance ID
+    state.instance_counter += 1
+    instance_id = f"{sprite_name}_{state.instance_counter:03d}"
+
+    # Create instance
+    instance = SpriteInstance(
+        library_key=library_key,
+        instance_id=instance_id,
+        x=state.cursor_x,
+        y=state.cursor_y,
+        initial_animation=None
+    )
+
+    state.sprite_instances[instance_id] = instance
+
+    # Create preview sprite
+    add_scene_preview_sprite(instance_id, instance)
+
+    state.modified = True
+    state.set_status(f"Placed: {instance_id}")
+
+
+def delete_sprite_at_cursor():
+    """Delete any sprite instance at the cursor position"""
+    # Find sprite at cursor
+    for instance_id, instance in list(state.sprite_instances.items()):
+        # Get sprite dimensions
+        lib_path = instance.library_key.split(':')[0]
+        sprite_name = instance.library_key.split(':')[1]
+
+        if lib_path in state.sprite_library:
+            sprite_def = state.sprite_library[lib_path].sprite_defs.get(sprite_name, {})
+            w = sprite_def.get('width', 1)
+            h = sprite_def.get('height', 1)
+        else:
+            w, h = 1, 1
+
+        # Check if cursor is within sprite bounds
+        if (instance.x <= state.cursor_x < instance.x + w and
+            instance.y <= state.cursor_y < instance.y + h):
+            # Remove preview sprite
+            remove_scene_preview_sprite(instance_id)
+            del state.sprite_instances[instance_id]
+            state.modified = True
+            state.set_status(f"Deleted: {instance_id}")
+            return
+
+    state.set_status("No sprite at cursor")
+
+
+def get_sprite_at_cursor() -> Optional[SpriteInstance]:
+    """Get sprite instance at cursor position, if any"""
+    for instance_id, instance in state.sprite_instances.items():
+        lib_path = instance.library_key.split(':')[0]
+        sprite_name = instance.library_key.split(':')[1]
+
+        if lib_path in state.sprite_library:
+            sprite_def = state.sprite_library[lib_path].sprite_defs.get(sprite_name, {})
+            w = sprite_def.get('width', 1)
+            h = sprite_def.get('height', 1)
+        else:
+            w, h = 1, 1
+
+        if (instance.x <= state.cursor_x < instance.x + w and
+            instance.y <= state.cursor_y < instance.y + h):
+            return instance
+
+    return None
+
+
+def cycle_sprite_animation(instance: SpriteInstance):
+    """Cycle to the next animation for a sprite instance"""
+    lib_path = instance.library_key.split(':')[0]
+    sprite_name = instance.library_key.split(':')[1]
+
+    if lib_path not in state.sprite_library:
+        state.set_status("Sprite library not loaded")
+        return
+
+    sprite_def = state.sprite_library[lib_path].sprite_defs.get(sprite_name, {})
+    animations = sprite_def.get('animations', {})
+
+    if not animations:
+        state.set_status(f"{sprite_name} has no animations")
+        return
+
+    anim_names = list(animations.keys())
+    current = instance.initial_animation
+
+    if current is None or current not in anim_names:
+        # Set to first animation
+        instance.initial_animation = anim_names[0]
+    else:
+        # Cycle to next
+        idx = anim_names.index(current)
+        next_idx = (idx + 1) % len(anim_names)
+        instance.initial_animation = anim_names[next_idx]
+
+    state.modified = True
+    state.set_status(f"{instance.instance_id}: {instance.initial_animation}")
+
+
+# ============================================================================
 # FILE I/O (Python Code Format)
 # ============================================================================
+
+GENERATED_DIR = "generated_files"
+
 
 def save_file(path: str):
     """Save as executable Python code (sprite or scene format)"""
     if not path.endswith('.py'):
         path += '.py'
 
+    # Put files in generated_files/ unless path is absolute or already has a directory
+    if not os.path.isabs(path) and os.path.dirname(path) == '':
+        os.makedirs(GENERATED_DIR, exist_ok=True)
+        path = os.path.join(GENERATED_DIR, path)
+
     try:
         # Save current cells to current frame before saving
         if state.editor_mode == "sprite":
             state.frames[state.current_frame].cells = dict(state.cells)
-            code = generate_sprite_code(path)
+            code = generate_sprite_code(os.path.basename(path))
         else:
-            code = generate_scene_code(path)
+            code = generate_scene_code(os.path.basename(path))
 
         with open(path, 'w', encoding='utf-8') as f:
             f.write(code)
@@ -2531,11 +3333,39 @@ def generate_scene_code(filename: str) -> str:
         '',
         'import pygame',
         'import pyunicodegame',
+    ]
+
+    # Collect unique library paths used by sprite instances
+    used_libraries = set()
+    for instance in state.sprite_instances.values():
+        lib_path = instance.library_key.split(':')[0]
+        used_libraries.add(lib_path)
+
+    # Generate imports for sprite libraries
+    lib_imports = {}  # lib_path -> module_name
+    for lib_path in sorted(used_libraries):
+        # Create a valid Python identifier from the path
+        module_name = os.path.splitext(os.path.basename(lib_path))[0]
+        module_name = module_name.replace('-', '_').replace(' ', '_')
+        lib_imports[lib_path] = module_name
+
+    if lib_imports:
+        lines.append('')
+        lines.append('# Sprite library imports')
+        for lib_path, module_name in lib_imports.items():
+            # Import path relative to scene file
+            import_path = lib_path.replace('/', '.').replace('.py', '')
+            if '.' in import_path:
+                lines.append(f'from {import_path} import SPRITE_DEFS as {module_name}_SPRITES')
+            else:
+                lines.append(f'from {import_path} import SPRITE_DEFS as {module_name}_SPRITES')
+
+    lines.extend([
         '',
         '',
         'def render_scene(window):',
-        '    """Render the scene to a window"""',
-    ]
+        '    """Render static character placements to the scene"""',
+    ])
 
     # Group cells by row for cleaner output
     rows = {}
@@ -2555,9 +3385,39 @@ def generate_scene_code(filename: str) -> str:
                 else:
                     lines.append(f'    window.put({x}, {y}, {char_repr}, {fg_repr})')
     else:
-        lines.append('    pass  # Empty scene')
+        lines.append('    pass  # No static characters')
+
+    # Generate sprite creation function
+    lines.extend([
+        '',
+        '',
+        'def create_scene_sprites(window):',
+        '    """Create and position sprite instances in the scene"""',
+        '    sprites = {}',
+    ])
+
+    if state.sprite_instances:
+        lines.append('')
+        for instance_id, instance in sorted(state.sprite_instances.items()):
+            lib_path = instance.library_key.split(':')[0]
+            sprite_name = instance.library_key.split(':')[1]
+            module_name = lib_imports.get(lib_path, 'unknown')
+
+            lines.append(f"    # {instance_id}")
+            lines.append(f"    sprites['{instance_id}'] = pyunicodegame.Sprite(")
+            lines.append(f"        {module_name}_SPRITES['{sprite_name}'],")
+            lines.append(f"        {instance.x}, {instance.y}")
+            lines.append(f"    )")
+            lines.append(f"    window.add_sprite(sprites['{instance_id}'])")
+            if instance.initial_animation:
+                lines.append(f"    sprites['{instance_id}'].play_animation('{instance.initial_animation}')")
+            lines.append('')
+    else:
+        lines.append('    pass  # No sprite instances')
+        lines.append('')
 
     lines.extend([
+        '    return sprites',
         '',
         '',
         'def main():',
@@ -2568,32 +3428,63 @@ def generate_scene_code(filename: str) -> str:
         f'        bg=(10, 10, 20, 255)',
         f'    )',
         '',
+        '    sprites = create_scene_sprites(root)',
+        '',
         '    def render():',
         '        render_scene(root)',
+        '',
+        '    def update(dt):',
+        '        root.update_sprites(dt)',
         '',
         '    def on_key(key):',
         '        if key == pygame.K_q:',
         '            pyunicodegame.quit()',
         '',
-        '    pyunicodegame.run(render=render, on_key=on_key)',
+        '    pyunicodegame.run(render=render, update=update, on_key=on_key)',
         '',
         '',
         '# Scene metadata for editor reload',
         '_SCENE_META = {',
         f"    'width': {state.canvas_width},",
         f"    'height': {state.canvas_height},",
-        "    'cells': {",
+        "    'char_placements': {",
     ])
 
     # Add cell data for reloading
     for (x, y), cell in sorted(state.cells.items()):
         char_repr = repr(cell.char)
-        fg_repr = str(cell.fg)
-        bg_repr = str(cell.bg) if cell.bg else 'None'
+        fg_repr = str(list(cell.fg))
+        bg_repr = str(list(cell.bg)) if cell.bg else 'None'
         lines.append(f"        ({x}, {y}): {{'char': {char_repr}, 'fg': {fg_repr}, 'bg': {bg_repr}}},")
 
     lines.extend([
-        '    }',
+        '    },',
+        "    'sprite_instances': {",
+    ])
+
+    # Add sprite instance data for reloading
+    for instance_id, instance in sorted(state.sprite_instances.items()):
+        lines.append(f"        '{instance_id}': {{")
+        lines.append(f"            'library_key': '{instance.library_key}',")
+        lines.append(f"            'x': {instance.x},")
+        lines.append(f"            'y': {instance.y},")
+        if instance.initial_animation:
+            lines.append(f"            'initial_animation': '{instance.initial_animation}',")
+        else:
+            lines.append(f"            'initial_animation': None,")
+        lines.append(f"        }},")
+
+    lines.extend([
+        '    },',
+        "    'sprite_library': [",
+    ])
+
+    # Add library paths for reloading
+    for lib_path in sorted(state.sprite_library.keys()):
+        lines.append(f"        '{lib_path}',")
+
+    lines.extend([
+        '    ],',
         '}',
         '',
         '',
@@ -2610,13 +3501,29 @@ def load_file(path: str):
     if not path.endswith('.py'):
         path += '.py'
 
+    # Try generated_files/ if file not found directly
+    if not os.path.exists(path) and not os.path.isabs(path):
+        gen_path = os.path.join(GENERATED_DIR, path)
+        if os.path.exists(gen_path):
+            path = gen_path
+
     try:
         with open(path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Execute file to get metadata
-        namespace = {}
-        exec(content, namespace)
+        # Temporarily add file's directory to sys.path for imports
+        file_dir = os.path.dirname(os.path.abspath(path))
+        sys.path.insert(0, file_dir)
+
+        try:
+            # Execute file to get metadata
+            # Include pyunicodegame and pygame in namespace since files import them
+            namespace = {'pyunicodegame': pyunicodegame, 'pygame': pygame}
+            exec(content, namespace)
+        finally:
+            # Remove from path
+            if file_dir in sys.path:
+                sys.path.remove(file_dir)
 
         # Check if it's a sprite file (has SPRITE_DEFS)
         if 'SPRITE_DEFS' in namespace:
@@ -2635,9 +3542,10 @@ def load_file(path: str):
         state.canvas_width = meta.get('width', DEFAULT_CANVAS_WIDTH)
         state.canvas_height = meta.get('height', DEFAULT_CANVAS_HEIGHT)
 
-        # Load cells
+        # Load cells (support both old 'cells' and new 'char_placements' key)
         state.cells.clear()
-        for (x, y), cell_data in meta.get('cells', {}).items():
+        cell_data_dict = meta.get('char_placements', meta.get('cells', {}))
+        for (x, y), cell_data in cell_data_dict.items():
             cell = Cell(
                 char=cell_data['char'],
                 fg=tuple(cell_data['fg']),
@@ -2645,11 +3553,52 @@ def load_file(path: str):
             )
             state.cells[(x, y)] = cell
 
+        # Load sprite library files (relative to scene file)
+        state.sprite_library.clear()
+        scene_dir = os.path.dirname(os.path.abspath(path))
+        for lib_path in meta.get('sprite_library', []):
+            full_path = os.path.join(scene_dir, lib_path) if not os.path.isabs(lib_path) else lib_path
+            if os.path.exists(full_path):
+                load_sprite_library(lib_path, scene_dir)
+            else:
+                state.set_status(f"Warning: library not found: {lib_path}")
+
+        # Load sprite instances
+        state.sprite_instances.clear()
+        state.instance_counter = 0
+        for instance_id, inst_data in meta.get('sprite_instances', {}).items():
+            instance = SpriteInstance(
+                library_key=inst_data['library_key'],
+                instance_id=instance_id,
+                x=inst_data['x'],
+                y=inst_data['y'],
+                initial_animation=inst_data.get('initial_animation')
+            )
+            state.sprite_instances[instance_id] = instance
+            # Track highest instance counter
+            try:
+                num = int(instance_id.split('_')[-1])
+                if num > state.instance_counter:
+                    state.instance_counter = num
+            except ValueError:
+                pass
+
         state.file_path = path
         state.modified = False
         state.cursor_x = 0
         state.cursor_y = 0
-        state.set_status(f"Loaded scene: {path} ({len(state.cells)} cells)")
+        state.scene_tool = "char"
+        state.selected_library_sprite = None
+
+        # Recreate scene window with loaded dimensions
+        setup_sprite_window()
+
+        # Create preview sprites for all placed instances
+        refresh_all_scene_sprites()
+
+        sprite_count = len(state.sprite_instances)
+        lib_count = len(state.sprite_library)
+        state.set_status(f"Loaded scene: {len(state.cells)} chars, {sprite_count} sprites, {lib_count} libs")
 
     except FileNotFoundError:
         state.set_status(f"File not found: {path}")
@@ -2764,6 +3713,10 @@ def update(dt: float):
 
             # Load new frame
             state.cells = dict(state.frames[state.current_frame].cells)
+
+    # Update scene sprites using pyunicodegame's animation system
+    if state.editor_mode == "scene" and state.sprite_instances and sprite_win:
+        sprite_win.update_sprites(dt)
 
     # Decay status message
     if state.status_message_time > 0:
