@@ -1842,9 +1842,8 @@ def update(dt: float):
         state.cursor_blink_timer = 0
         state.cursor_visible = not state.cursor_visible
 
-    # In preview mode, use pyunicodegame's sprite animation system
-    if state.mode == EditorMode.ANIMATION_PREVIEW and models.root:
-        models.root.update_sprites(dt)
+    # In preview mode, pyunicodegame handles sprite updates automatically in its run loop
+    if state.mode == EditorMode.ANIMATION_PREVIEW:
         # Still decay status message
         if state.status_message_time > 0:
             state.status_message_time -= dt
@@ -1881,9 +1880,7 @@ def update(dt: float):
             # Load new frame
             state.cells = dict(state.frames[state.current_frame].cells)
 
-    # Update scene sprites using pyunicodegame's animation system
-    if state.editor_mode == "scene" and state.sprite_instances and models.sprite_win:
-        models.sprite_win.update_sprites(dt)
+    # Note: Scene sprite updates are handled automatically by pyunicodegame's run loop
 
     # Decay status message
     if state.status_message_time > 0:
