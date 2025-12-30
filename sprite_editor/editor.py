@@ -399,6 +399,10 @@ def handle_normal_mode(key):
     elif key == pygame.K_4 and pygame.key.get_mods() & pygame.KMOD_SHIFT:  # $
         state.cursor_x = state.canvas_width - 1
 
+    # Scene mode: Shift+D to delete sprite (must be before plain 'd' handler)
+    elif key == pygame.K_d and pygame.key.get_mods() & pygame.KMOD_SHIFT and state.editor_mode == "scene":
+        delete_sprite_at_cursor()
+
     # Multi-key sequences
     elif key == pygame.K_g:
         state.pending_key = 'g'
@@ -572,10 +576,6 @@ def handle_normal_mode(key):
         models.sprite_win.visible = False
         models.status_win.visible = False
 
-    elif key == pygame.K_d and pygame.key.get_mods() & pygame.KMOD_SHIFT and state.editor_mode == "scene":
-        # D = delete sprite under cursor
-        delete_sprite_at_cursor()
-
     elif key == pygame.K_a and state.editor_mode == "scene":
         # a = cycle animation on sprite under cursor
         sprite = get_sprite_at_cursor()
@@ -677,10 +677,6 @@ def handle_insert_mode(key):
         # Insert spaces
         for _ in range(4):
             place_current_char(' ')
-
-    elif key == pygame.K_SPACE:
-        # Space places the current palette character
-        place_current_char(state.current_char)
 
     else:
         # Try to get the character from the key
