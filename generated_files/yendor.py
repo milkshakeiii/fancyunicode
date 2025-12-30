@@ -37,6 +37,7 @@ def render_scene(window):
     window.put(42, 1, '𝓰', (255, 255, 255))
     window.put(43, 1, '𝓲', (255, 255, 255))
     window.put(44, 1, '𝓬', (255, 255, 255))
+    window.put(45, 1, '𝓴', (255, 255, 255))
     # Row 2: "Contained within the staff of Yendor"
     window.put(12, 2, '𝐂', (255, 255, 255))
     window.put(13, 2, '𝐨', (255, 255, 255))
@@ -194,6 +195,7 @@ _SCENE_META = {
         (42, 1): {'char': '𝓰', 'fg': [255, 255, 255], 'bg': None},
         (43, 1): {'char': '𝓲', 'fg': [255, 255, 255], 'bg': None},
         (44, 1): {'char': '𝓬', 'fg': [255, 255, 255], 'bg': None},
+        (45, 1): {'char': '𝓴', 'fg': [255, 255, 255], 'bg': None},
         # Row 2: "Contained within the staff of Yendor"
         (12, 2): {'char': '𝐂', 'fg': [255, 255, 255], 'bg': None},
         (13, 2): {'char': '𝐨', 'fg': [255, 255, 255], 'bg': None},
