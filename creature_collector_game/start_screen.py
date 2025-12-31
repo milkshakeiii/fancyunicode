@@ -104,9 +104,47 @@ class StartScreen:
         self.cover_sprites = []
         self._create_cover_sprites()
 
+        # Enable lighting system
+        self.root.set_lighting(enabled=True, ambient=(50, 50, 55))
+
+        # Enable bloom for emissive glow
+        self.root.set_bloom(enabled=True, threshold=220, blur_scale=1, intensity=0.2)
+
         # Ambient corner lights (dim initially)
         self.corner_lights = []
         self._create_corner_lights()
+
+        # Magic word sprites (white emissive)
+        self.magic_sprites = {'line1': [], 'line2': [], 'line3': []}
+        self._create_magic_word_sprites()
+
+    def _create_magic_word_sprites(self):
+        """Create emissive sprites for the magic words."""
+        white_color = (255, 255, 255)
+
+        # Line 1: "Magick" - indices 19-24 (white emissive)
+        for i in range(19, len(LINE1_CHARS)):
+            x, y, char = LINE1_CHARS[i]
+            sprite = pyunicodegame.create_sprite(char, x=x, y=y, fg=white_color, emissive=True)
+            sprite.visible = False
+            self.root.add_sprite(sprite)
+            self.magic_sprites['line1'].append(sprite)
+
+        # Line 2: "Staff of Yendor" - indices 18-30 (white emissive)
+        for i in range(18, len(LINE2_CHARS)):
+            x, y, char = LINE2_CHARS[i]
+            sprite = pyunicodegame.create_sprite(char, x=x, y=y, fg=white_color, emissive=True)
+            sprite.visible = False
+            self.root.add_sprite(sprite)
+            self.magic_sprites['line2'].append(sprite)
+
+        # Line 3: "Reason" - indices 27-32 (white emissive)
+        for i in range(27, len(LINE3_CHARS)):
+            x, y, char = LINE3_CHARS[i]
+            sprite = pyunicodegame.create_sprite(char, x=x, y=y, fg=white_color, emissive=True)
+            sprite.visible = False
+            self.root.add_sprite(sprite)
+            self.magic_sprites['line3'].append(sprite)
 
     def _create_cover_sprites(self):
         """Create cover sprites that hide text until revealed."""
@@ -120,16 +158,16 @@ class StartScreen:
     def _create_corner_lights(self):
         """Create ambient lights at the four corners."""
         corners = [
-            (2, 2),           # top-left
-            (WIDTH - 3, 2),   # top-right
-            (2, HEIGHT - 3),  # bottom-left
-            (WIDTH - 3, HEIGHT - 3),  # bottom-right
+            (5, 4),           # top-left
+            (WIDTH - 6, 4),   # top-right
+            (5, HEIGHT - 5),  # bottom-left
+            (WIDTH - 6, HEIGHT - 5),  # bottom-right
         ]
 
         for x, y in corners:
             light = pyunicodegame.create_light(
                 x=x, y=y,
-                radius=12,
+                radius=30,
                 color=(60, 40, 100),  # Dim purple ambient
                 intensity=0.3,
                 falloff=1.5,
@@ -235,19 +273,31 @@ class StartScreen:
     def render(self):
         """Render the scene."""
         # Draw revealed characters from line 1
+        # "Magick" is indices 19-24 (last 6 chars) - handled by sprites
         for i in range(self.line1_revealed):
             x, y, char = LINE1_CHARS[i]
-            self.root.put(x, y, char, (255, 255, 255))
+            if i >= 19:  # Magick - show sprite instead
+                self.magic_sprites['line1'][i - 19].visible = True
+            else:
+                self.root.put(x, y, char, (255, 255, 255))
 
         # Draw revealed characters from line 2
+        # "Staff of Yendor" is indices 18-30 (last 13 chars) - handled by sprites
         for i in range(self.line2_revealed):
             x, y, char = LINE2_CHARS[i]
-            self.root.put(x, y, char, (255, 255, 255))
+            if i >= 18:  # Staff of Yendor - show sprite instead
+                self.magic_sprites['line2'][i - 18].visible = True
+            else:
+                self.root.put(x, y, char, (255, 255, 255))
 
         # Draw revealed characters from line 3
+        # "Reason" is indices 27-32 (last 6 chars) - handled by sprites
         for i in range(self.line3_revealed):
             x, y, char = LINE3_CHARS[i]
-            self.root.put(x, y, char, (255, 255, 255))
+            if i >= 27:  # Reason - show sprite instead
+                self.magic_sprites['line3'][i - 27].visible = True
+            else:
+                self.root.put(x, y, char, (255, 255, 255))
 
         # Draw revealed characters from line 4
         for i in range(self.line4_revealed):
