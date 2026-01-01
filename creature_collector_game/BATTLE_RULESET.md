@@ -68,7 +68,8 @@ ability systems flexible for later expansion.
 - The unit shifts its footprint by 1 square.
 - The move is valid if:
   - The destination footprint is entirely inside the grid.
-  - No destination square contains an enemy unit.
+  - The destination footprint stays within the unit's own side (no crossing into
+    the enemy grid).
   - If destination squares contain allied units, those units are displaced by
     the inverse shift (one square) and their footprints remain valid (no overlap,
     in bounds).
