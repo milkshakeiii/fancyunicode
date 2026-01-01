@@ -319,7 +319,8 @@ def render_palette_categories():
         state.palette_category = len(PALETTE_CATEGORIES) - 1
 
     # Calculate visible range for scrolling
-    visible_rows = h - 8  # Leave room for header, special options, and footer
+    # y starts at 4, breaks at h-6, so actual visible = h - 10
+    visible_rows = h - 10
     max_scroll = max(0, len(PALETTE_CATEGORIES) - visible_rows)
     scroll_offset = max(0, min(state.palette_category - visible_rows // 2, max_scroll))
 

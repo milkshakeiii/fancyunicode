@@ -746,11 +746,11 @@ def handle_palette_categories(key):
         state.set_status("")
         return
 
-    # Navigation
+    # Navigation (with wraparound)
     if key in (pygame.K_j, pygame.K_DOWN):
-        state.palette_category = min(len(PALETTE_CATEGORIES) - 1, state.palette_category + 1)
+        state.palette_category = (state.palette_category + 1) % len(PALETTE_CATEGORIES)
     elif key in (pygame.K_k, pygame.K_UP):
-        state.palette_category = max(0, state.palette_category - 1)
+        state.palette_category = (state.palette_category - 1) % len(PALETTE_CATEGORIES)
     elif key in (pygame.K_EQUALS, pygame.K_PAGEUP):
         # Page up - skip 10 categories
         state.palette_category = max(0, state.palette_category - 10)
@@ -1174,6 +1174,9 @@ def execute_command(cmd: str):
         # List all frames
         state.set_status(f"Frames: {len(state.frames)} (current: {state.current_frame + 1})")
 
+    elif command in ('delframe', 'df'):
+        handle_delframe_command(args)
+
     elif command in ('anim', 'animation', 'a'):
         handle_anim_command(args)
 
@@ -1430,6 +1433,53 @@ def handle_frame_command(args: str):
 
     else:
         state.set_status("Usage: :frame [N] - add new frame or switch to frame N")
+
+
+def handle_delframe_command(args: str):
+    """Handle :delframe command to delete a sprite frame"""
+    args = args.strip()
+
+    if len(state.frames) <= 1:
+        state.set_status("Cannot delete - need at least 1 frame")
+        return
+
+    # Determine which frame to delete
+    if args:
+        try:
+            frame_num = int(args) - 1  # 1-indexed for user
+            if not (0 <= frame_num < len(state.frames)):
+                state.set_status(f"Invalid frame {args} (1-{len(state.frames)})")
+                return
+        except ValueError:
+            state.set_status("Usage: :delframe [N] - delete frame N (or current)")
+            return
+    else:
+        frame_num = state.current_frame
+
+    # Delete the frame
+    del state.frames[frame_num]
+
+    # Update any animations that reference this or higher frames
+    for anim in state.animations.values():
+        new_frames = []
+        for af in anim.frames:
+            if af.frame_index == frame_num:
+                # Skip frames that reference the deleted frame
+                continue
+            elif af.frame_index > frame_num:
+                # Decrement frame indices above the deleted one
+                af.frame_index -= 1
+            new_frames.append(af)
+        anim.frames = new_frames
+
+    # Adjust current frame if needed
+    if state.current_frame >= len(state.frames):
+        state.current_frame = len(state.frames) - 1
+
+    # Load the current frame's cells
+    state.cells = dict(state.frames[state.current_frame].cells)
+    state.modified = True
+    state.set_status(f"Deleted frame {frame_num + 1} (now {len(state.frames)} frames)")
 
 
 def handle_anim_command(args: str):
