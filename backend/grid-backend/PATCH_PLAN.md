@@ -1,4 +1,4 @@
-# Grid Backend Patch Plan (Draft)
+# Grid Backend Patch Plan (Implemented)
 
 ## Decisions (locked scope)
 
@@ -12,7 +12,7 @@
 - Update `README.md` to describe SQLite-first setup (`DATABASE_URL=sqlite+aiosqlite:///./gridbackend.db`) and remove “PostgreSQL required” language.
 - Update `app_spec.txt` to reflect SQLite as the current target DB.
 - Update `init.sh` to generate `.env` with SQLite URL by default and remove Postgres-specific setup steps (or gate them behind an explicit opt-in).
-- Update `requirements.txt` to include `aiosqlite`; remove `asyncpg` from default deps to keep installs easy.
+- Update `requirements.txt` to include `aiosqlite`; remove `asyncpg` entirely (Postgres support can be re-added later if needed).
 
 ## Phase 2 — Redefine the game-module contract (no redundant entity snapshot)
 
@@ -43,10 +43,10 @@
 - Update `grid_backend/tick_engine/engine.py` so intent enqueue/dequeue can’t race (make `queue_intent` lock-protected; likely `async def queue_intent(...)` using `_intent_lock`).
 - Update `grid_backend/websocket/handler.py` to `await` intent enqueue before acknowledging `intent_received`.
 
-## Phase 5 — Fail-fast on internal errors (dev)
+## Phase 5 — Fail-fast on internal errors
 
 - Update `grid_backend/tick_engine/engine.py` to stop swallowing exceptions in the tick loop / zone processing / game logic; let errors propagate.
-- Ensure a tick-task failure takes down the server (not just “silently stops ticking”) so bugs are immediately visible during development.
+- Ensure a tick-task failure takes down the server (not just "silently stops ticking") so bugs are immediately visible.
 - Narrow exception handling to *expected* network/protocol failures only (non-fatal):
   - WebSocket disconnects (`WebSocketDisconnect`)
   - send timeouts (`asyncio.TimeoutError`)
@@ -62,15 +62,7 @@
   - best-effort close the old websocket when a new connection for the same player is established.
 - Update `grid_backend/websocket/handler.py` and `grid_backend/main.py` so only one layer owns the disconnect path (no double-disconnect) and it passes the connection identity through.
 
-## Phase 7 — Scalability improvements (stop loading the whole world every tick)
-
-- Update `grid_backend/websocket/manager.py` to expose “subscribed zone ids” safely (under lock).
-- Update `grid_backend/tick_engine/engine.py` to compute:
-  - `active_zone_ids = subscribed_zones ∪ zones_with_queued_intents`
-  - process only active zones each tick (tick loop still runs even if none are active).
-- Replace “select all zones + selectinload all entities” with “select active zones”.
-
-## Phase 8 — Tests + scripts updated to the new reality
+## Phase 7 — Tests + scripts updated to the new reality
 
 - Update `tests/conftest.py` to run on SQLite and set `DEBUG_USER` so debug-only endpoints can be exercised.
 - Update `tests/test_websocket_live.py` to authenticate as the configured debug user before creating zones, and keep assertions aligned with the new tick payload shape (framework-built entities + per-player filtering + extras/events).
@@ -81,6 +73,5 @@
 - Server boots from scratch with SQLite using the documented steps.
 - Tick messages include an entity snapshot consistent with the post-apply DB state for that tick (no 1-tick lag for creates/deletes).
 - No client receives unfiltered/full state if the module redacts via `get_player_state`.
-- Internal (server-side) logic errors crash the server in dev; expected network/protocol failures do not.
+- Internal (server-side) logic errors crash the server; expected network/protocol failures do not.
 - Reconnect cannot cause a stale socket to disconnect the new session.
-- Tick engine doesn’t load/process every zone when only a few are active.

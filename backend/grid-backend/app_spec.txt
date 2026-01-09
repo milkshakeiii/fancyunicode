@@ -14,8 +14,8 @@
       <framework>FastAPI</framework>
       <async>asyncio</async>
       <websockets>FastAPI WebSocket support</websockets>
-      <database>PostgreSQL</database>
-      <orm>SQLAlchemy (async) or asyncpg</orm>
+      <database>SQLite (via aiosqlite)</database>
+      <orm>SQLAlchemy (async)</orm>
     </backend>
     <communication>
       <realtime>WebSocket for game state and intents</realtime>
@@ -27,9 +27,8 @@
   <prerequisites>
     <environment_setup>
       - Python 3.11 or higher
-      - PostgreSQL database
       - Virtual environment (venv or similar)
-      - Dependencies: fastapi, uvicorn, websockets, sqlalchemy, asyncpg, pydantic, passlib (for password hashing)
+      - Dependencies: fastapi, uvicorn, websockets, sqlalchemy, aiosqlite, pydantic, passlib (for password hashing)
     </environment_setup>
   </prerequisites>
 
@@ -273,6 +272,17 @@
   <game_logic_module_interface>
     <description>
       Game logic modules must implement this Python protocol. The framework loads one module at startup and calls it each tick.
+
+      Broadcast pipeline:
+      1. Framework calls on_tick() and receives entity deltas + extras
+      2. Framework applies entity deltas to DB
+      3. Framework builds base_state from post-apply entities (authoritative snapshot)
+      4. Framework merges in extras from TickResult
+      5. For each subscriber, framework calls get_player_state() to filter/redact
+      6. Framework sends filtered state to each player
+
+      This ensures the framework owns the authoritative entity snapshot. Game modules only provide
+      entity deltas (creates/updates/deletes) and non-entity extras (events, notifications, etc.).
     </description>
     <protocol>
       class GameLogicModule(Protocol):
@@ -289,7 +299,8 @@
           ) -> TickResult:
               """
               Called each tick for each zone.
-              Returns state changes to apply and state to broadcast.
+              Returns entity deltas to apply and extras to include in broadcast.
+              NOTE: Do NOT return an entity snapshot in extras - the framework builds that.
               """
               ...
 
@@ -301,7 +312,9 @@
           ) -> dict:
               """
               Filter/transform state for a specific player.
-              Allows fog-of-war or player-specific views.
+              Canonical fog-of-war/redaction hook.
+              full_state contains framework-built entity snapshot + extras from on_tick.
+              Return the state to send to this specific player.
               """
               ...
     </protocol>
@@ -311,7 +324,7 @@
           entity_creates: list[EntityCreate]
           entity_updates: list[EntityUpdate]
           entity_deletes: list[UUID]
-          broadcast_state: dict  # State to send to clients
+          extras: dict  # Non-entity payload (events, notifications) - NOT an entity snapshot
     </tick_result>
   </game_logic_module_interface>
 
@@ -320,7 +333,7 @@
       <title>Project Setup and Database</title>
       <tasks>
         - Initialize Python project with FastAPI
-        - Configure PostgreSQL connection with async support
+        - Configure SQLite connection with async support (aiosqlite)
         - Define SQLAlchemy models for players, sessions, zones, entities
         - Create database initialization script
         - Set up configuration management (environment variables)

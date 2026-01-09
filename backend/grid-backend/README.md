@@ -13,7 +13,7 @@ Grid Backend is designed for "massively" multiplayer persistent worlds with a 1-
 - **Zone-based world**: 2D grid zones with entity management
 - **Swappable game logic**: Implement your game rules in a pluggable module
 - **Player authentication**: Username/password with session tokens
-- **Persistence**: PostgreSQL database for zones, entities, and player data
+- **Persistence**: SQLite database for zones, entities, and player data (easy setup)
 - **Debug tools**: Pause/resume ticks, inspect state, manual tick stepping
 
 ## Architecture Principles
@@ -27,7 +27,6 @@ Grid Backend is designed for "massively" multiplayer persistent worlds with a 1-
 ## Prerequisites
 
 - Python 3.11 or higher
-- PostgreSQL database
 - Virtual environment (venv or similar)
 
 ## Quick Start
@@ -55,7 +54,7 @@ Grid Backend is designed for "massively" multiplayer persistent worlds with a 1-
 Edit the `.env` file to customize settings:
 
 ```env
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/gridbackend
+DATABASE_URL=sqlite+aiosqlite:///./gridbackend.db
 SECRET_KEY=your-secret-key-here
 DEBUG_MODE=true
 TICK_RATE_MS=1000
@@ -118,7 +117,7 @@ class TickResult:
     entity_creates: list[EntityCreate]
     entity_updates: list[EntityUpdate]
     entity_deletes: list[UUID]
-    broadcast_state: dict
+    extras: dict  # Non-entity payload (events, notifications)
 
 class GameLogicModule(Protocol):
     def on_init(self, framework: FrameworkAPI) -> None:
@@ -132,7 +131,7 @@ class GameLogicModule(Protocol):
         intents: list[Intent],
         tick_number: int
     ) -> TickResult:
-        """Called each tick for each zone."""
+        """Called each tick for each zone. Returns entity deltas + extras."""
         ...
 
     def get_player_state(
@@ -141,9 +140,11 @@ class GameLogicModule(Protocol):
         player_id: UUID,
         full_state: dict
     ) -> dict:
-        """Filter/transform state for a specific player."""
+        """Filter/transform state for a specific player (fog-of-war)."""
         ...
 ```
+
+The framework builds the authoritative entity snapshot after applying deltas, then calls `get_player_state` for each subscriber to apply fog-of-war/redaction.
 
 ## Project Structure
 

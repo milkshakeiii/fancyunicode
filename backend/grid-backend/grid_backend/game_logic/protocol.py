@@ -52,12 +52,19 @@ class EntityUpdate:
 class TickResult:
     """
     Result returned by game logic after processing a tick.
+
+    The framework owns the authoritative entity snapshot. Game modules return:
+    - entity_creates/updates/deletes: deltas to apply (persisted by framework)
+    - extras: arbitrary non-entity payload (events, notifications, etc.)
+
+    Do NOT include an entity snapshot in extras - the framework builds that
+    from post-apply state and passes it to get_player_state for filtering.
     """
 
     entity_creates: list[EntityCreate] = field(default_factory=list)
     entity_updates: list[EntityUpdate] = field(default_factory=list)
     entity_deletes: list[UUID] = field(default_factory=list)
-    broadcast_state: dict[str, Any] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
 
 
 class FrameworkAPI:
@@ -125,7 +132,13 @@ class GameLogicModule(Protocol):
     ) -> dict[str, Any]:
         """
         Filter or transform state for a specific player.
-        Used for fog-of-war or player-specific views.
-        Return the state to send to this player.
+        Canonical fog-of-war/redaction hook.
+
+        full_state contains:
+        - zone_id, tick_number
+        - entities: framework-built authoritative snapshot (post-apply)
+        - any extras from on_tick result
+
+        Return the state to send to this specific player.
         """
         ...

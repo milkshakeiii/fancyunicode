@@ -4,6 +4,7 @@ Pytest fixtures for Grid Backend tests.
 
 import asyncio
 import os
+import tempfile
 from typing import AsyncGenerator
 
 import pytest
@@ -15,9 +16,15 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-# Set test environment
-os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@localhost:5432/gridbackend_test"
+# Create a temp file for SQLite test database
+_test_db_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_test_db_path = _test_db_file.name
+_test_db_file.close()
+
+# Set test environment - using SQLite
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_test_db_path}"
 os.environ["DEBUG_MODE"] = "true"
+os.environ["DEBUG_USER"] = "testdebug"  # Debug user for testing
 os.environ["SECRET_KEY"] = "test-secret-key"
 os.environ["TICK_RATE_MS"] = "100"  # Faster ticks for testing
 
@@ -25,7 +32,7 @@ from grid_backend.database import Base, get_db
 from grid_backend.main import app
 
 
-# Create test database engine
+# Create test database engine (SQLite)
 test_engine = create_async_engine(
     os.environ["DATABASE_URL"],
     echo=False,

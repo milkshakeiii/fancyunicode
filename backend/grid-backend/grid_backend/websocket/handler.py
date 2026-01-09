@@ -2,13 +2,16 @@
 WebSocket message handler for Grid Backend.
 """
 
+import asyncio
+import json
 import logging
 from typing import Any
 from uuid import UUID
 
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.websockets import WebSocketState
 
 from grid_backend.models.zone import Zone
 from grid_backend.websocket.manager import ConnectionInfo, ConnectionManager
@@ -33,18 +36,40 @@ class WebSocketHandler:
         self._running = True
 
     async def handle_connection(self) -> None:
-        """Main message loop for a WebSocket connection."""
+        """
+        Main message loop for a WebSocket connection.
+
+        Expected (non-fatal) errors:
+        - WebSocketDisconnect: client disconnected
+        - asyncio.TimeoutError: send timeout
+        - ConnectionResetError, BrokenPipeError: connection lost
+        - json.JSONDecodeError: invalid JSON -> close with 1007
+
+        All other errors propagate (fail-fast).
+        """
         try:
             while self._running:
-                message = await self.info.websocket.receive_json()
+                try:
+                    raw = await self.info.websocket.receive_text()
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Invalid JSON - close immediately with protocol error code
+                    logger.warning(f"Invalid JSON from player {self.info.player_id}, closing")
+                    await self.info.websocket.close(code=1007)  # Invalid frame payload
+                    return
                 await self._handle_message(message)
         except WebSocketDisconnect:
+            # Expected: client disconnected normally
             logger.info(f"Player {self.info.player_id} disconnected")
-        except Exception as e:
-            logger.error(f"Error in WebSocket handler: {e}")
-            await self._send_error(f"Internal error: {str(e)}")
+        except asyncio.TimeoutError:
+            # Expected: send timeout
+            logger.warning(f"Timeout for player {self.info.player_id}")
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            # Expected: connection lost
+            logger.info(f"Connection lost for player {self.info.player_id}: {e}")
         finally:
-            await self.manager.disconnect(self.info.player_id)
+            # Pass connection_id to prevent stale handler from disconnecting newer connection
+            await self.manager.disconnect(self.info.player_id, self.info.connection_id)
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
         """Route incoming messages to appropriate handlers."""
@@ -122,7 +147,8 @@ class WebSocketHandler:
             await self._send_error("Tick engine not available")
             return
 
-        engine.queue_intent(
+        # Await enqueue before acknowledging (ensures intent is queued)
+        await engine.queue_intent(
             zone_id=self.info.zone_id,
             player_id=self.info.player_id,
             data=intent_data,

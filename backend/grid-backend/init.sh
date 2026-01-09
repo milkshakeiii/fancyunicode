@@ -45,19 +45,11 @@ if [ -f "requirements.txt" ]; then
     pip install -r requirements.txt
 else
     echo -e "${RED}requirements.txt not found. Installing core dependencies...${NC}"
-    pip install fastapi uvicorn[standard] websockets sqlalchemy[asyncio] asyncpg pydantic passlib[bcrypt] python-jose[cryptography] alembic pytest pytest-asyncio httpx
+    pip install fastapi uvicorn[standard] websockets sqlalchemy[asyncio] aiosqlite pydantic passlib[bcrypt] python-jose[cryptography] alembic pytest pytest-asyncio httpx
 
     # Generate requirements.txt
     pip freeze > requirements.txt
     echo -e "${GREEN}Generated requirements.txt${NC}"
-fi
-
-# Check PostgreSQL
-echo -e "\n${YELLOW}Checking PostgreSQL...${NC}"
-if ! command -v psql &> /dev/null; then
-    echo -e "${YELLOW}PostgreSQL client not found. Make sure PostgreSQL is installed and running.${NC}"
-else
-    echo -e "${GREEN}PostgreSQL client found${NC}"
 fi
 
 # Create .env file if it doesn't exist
@@ -65,7 +57,7 @@ if [ ! -f ".env" ]; then
     echo -e "\n${YELLOW}Creating .env file with defaults...${NC}"
     cat > .env << EOF
 # Grid Backend Configuration
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/gridbackend
+DATABASE_URL=sqlite+aiosqlite:///./gridbackend.db
 SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
 DEBUG_MODE=true
 TICK_RATE_MS=1000
@@ -80,15 +72,6 @@ fi
 
 # Load environment variables
 export $(grep -v '^#' .env | xargs)
-
-# Initialize database
-echo -e "\n${YELLOW}Setting up database...${NC}"
-if command -v psql &> /dev/null; then
-    # Try to create database if it doesn't exist
-    psql -U postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'gridbackend'" | grep -q 1 || \
-        psql -U postgres -c "CREATE DATABASE gridbackend" 2>/dev/null || \
-        echo -e "${YELLOW}Could not create database. Please create it manually: CREATE DATABASE gridbackend;${NC}"
-fi
 
 # Run database migrations if they exist
 if [ -d "alembic" ]; then
@@ -129,5 +112,4 @@ echo -e "  ${YELLOW}ws://localhost:8000/ws${NC}"
 echo -e "\n${BLUE}Environment Configuration:${NC}"
 echo -e "  Edit ${YELLOW}.env${NC} file to customize settings"
 echo -e "\n${BLUE}Database:${NC}"
-echo -e "  Make sure PostgreSQL is running and database 'gridbackend' exists"
-echo -e "  Connection: ${YELLOW}postgresql://postgres:postgres@localhost:5432/gridbackend${NC}"
+echo -e "  SQLite database will be created automatically at ${YELLOW}./gridbackend.db${NC}"

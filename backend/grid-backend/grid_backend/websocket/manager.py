@@ -5,9 +5,9 @@ Handles player connections, zone subscriptions, and message broadcasting.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import WebSocket
 from sqlalchemy import select
@@ -39,6 +39,7 @@ class ConnectionInfo:
     player_id: UUID
     username: str
     websocket: WebSocket
+    connection_id: UUID = field(default_factory=uuid4)
     zone_id: UUID | None = None
 
 
@@ -92,36 +93,75 @@ class ConnectionManager:
         )
 
     async def connect(self, info: ConnectionInfo) -> None:
-        """Register a new connection."""
+        """
+        Register a new connection.
+        If player already has a connection, close the old one first.
+        """
         async with self._lock:
-            # Disconnect existing connection for this player if any
+            # Close existing connection for this player if any
             if info.player_id in self._connections:
-                await self._disconnect_internal(info.player_id)
+                old_info = self._connections[info.player_id]
+                logger.info(
+                    f"Player {info.username} reconnecting, closing old connection "
+                    f"{old_info.connection_id}"
+                )
+                # Best-effort close the old websocket
+                try:
+                    await old_info.websocket.close(code=1000)
+                except Exception:
+                    pass  # Old connection might already be closed
+                # Remove from zone subscriptions
+                await self._unsubscribe_internal(old_info)
 
             self._connections[info.player_id] = info
-            logger.info(f"Player {info.username} ({info.player_id}) connected")
+            logger.info(
+                f"Player {info.username} ({info.player_id}) connected "
+                f"[conn_id={info.connection_id}]"
+            )
 
-    async def disconnect(self, player_id: UUID) -> None:
-        """Unregister a connection."""
+    async def disconnect(self, player_id: UUID, connection_id: UUID | None = None) -> None:
+        """
+        Unregister a connection.
+        If connection_id is provided, only disconnect if it matches the current connection.
+        This prevents stale handlers from disconnecting newer connections.
+        """
         async with self._lock:
-            await self._disconnect_internal(player_id)
+            await self._disconnect_internal(player_id, connection_id)
 
-    async def _disconnect_internal(self, player_id: UUID) -> None:
+    async def _disconnect_internal(
+        self, player_id: UUID, connection_id: UUID | None = None
+    ) -> None:
         """Internal disconnect without lock (called when lock is already held)."""
         if player_id not in self._connections:
             return
 
         info = self._connections[player_id]
 
-        # Remove from zone subscription
-        if info.zone_id is not None:
-            if info.zone_id in self._zone_subscribers:
-                self._zone_subscribers[info.zone_id].discard(player_id)
-                if not self._zone_subscribers[info.zone_id]:
-                    del self._zone_subscribers[info.zone_id]
+        # If connection_id provided, only disconnect if it matches
+        if connection_id is not None and info.connection_id != connection_id:
+            logger.debug(
+                f"Ignoring stale disconnect for player {player_id}: "
+                f"expected {connection_id}, current is {info.connection_id}"
+            )
+            return
+
+        # Remove from zone subscriptions
+        await self._unsubscribe_internal(info)
 
         del self._connections[player_id]
-        logger.info(f"Player {info.username} ({player_id}) disconnected")
+        logger.info(
+            f"Player {info.username} ({player_id}) disconnected "
+            f"[conn_id={info.connection_id}]"
+        )
+
+    async def _unsubscribe_internal(self, info: ConnectionInfo) -> None:
+        """Remove a connection from its zone subscription (lock must be held)."""
+        if info.zone_id is not None:
+            if info.zone_id in self._zone_subscribers:
+                self._zone_subscribers[info.zone_id].discard(info.player_id)
+                if not self._zone_subscribers[info.zone_id]:
+                    del self._zone_subscribers[info.zone_id]
+            info.zone_id = None
 
     async def subscribe_to_zone(self, player_id: UUID, zone_id: UUID) -> bool:
         """

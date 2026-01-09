@@ -147,28 +147,29 @@ class TickEngine:
         await self._process_tick()
         logger.info(f"Manual tick step executed: {self._tick_number}")
 
-    def queue_intent(self, zone_id: UUID, player_id: UUID, data: dict[str, Any]) -> None:
+    async def queue_intent(self, zone_id: UUID, player_id: UUID, data: dict[str, Any]) -> None:
         """
         Queue an intent for processing on the next tick.
-        Thread-safe.
+        Lock-protected to prevent races with tick processing.
         """
         intent = Intent(player_id=player_id, zone_id=zone_id, data=data)
 
-        # Use non-async lock for immediate queuing
-        if zone_id not in self._intent_queues:
-            self._intent_queues[zone_id] = []
-        self._intent_queues[zone_id].append(intent)
+        async with self._intent_lock:
+            if zone_id not in self._intent_queues:
+                self._intent_queues[zone_id] = []
+            self._intent_queues[zone_id].append(intent)
 
     async def _run_loop(self) -> None:
-        """Main tick loop."""
+        """
+        Main tick loop.
+        Fail-fast: internal errors propagate and crash the server.
+        """
         while self._is_running:
             tick_start = time.perf_counter()
 
             if not self._is_paused:
-                try:
-                    await self._process_tick()
-                except Exception as e:
-                    logger.error(f"Error in tick loop: {e}", exc_info=True)
+                # No try/except here - internal errors should crash the server
+                await self._process_tick()
 
             # Calculate sleep time to maintain tick rate
             tick_duration = (time.perf_counter() - tick_start) * 1000
@@ -201,16 +202,10 @@ class TickEngine:
             zones = result.scalars().all()
 
             for zone in zones:
-                try:
-                    zone_intents = await self._process_zone(zone, db)
-                    zones_processed += 1
-                    intents_processed += zone_intents
-                except Exception as e:
-                    logger.error(
-                        f"Error processing zone {zone.id}: {e}",
-                        exc_info=True,
-                    )
-                    # Continue with other zones (error isolation)
+                # Fail-fast: zone processing errors propagate
+                zone_intents = await self._process_zone(zone, db)
+                zones_processed += 1
+                intents_processed += zone_intents
 
         # Record stats
         tick_duration = (time.perf_counter() - tick_start) * 1000
@@ -234,6 +229,14 @@ class TickEngine:
         """
         Process a single zone.
         Returns the number of intents processed.
+
+        Pipeline:
+        1. Get and clear intents
+        2. Call game logic on_tick()
+        3. Apply entity deltas (DB + in-memory)
+        4. Build authoritative base_state from post-apply entities
+        5. Merge in extras from game logic
+        6. For each subscriber: call get_player_state() and send
         """
         # Get and clear intents for this zone
         async with self._intent_lock:
@@ -244,25 +247,25 @@ class TickEngine:
 
         # Call game logic
         if self._game_logic is not None:
-            try:
-                result = self._game_logic.on_tick(
-                    zone_id=zone.id,
-                    entities=list(zone.entities),
-                    intents=intents,
-                    tick_number=self._tick_number,
-                )
+            # Fail-fast: game logic errors propagate
+            result = self._game_logic.on_tick(
+                zone_id=zone.id,
+                entities=list(zone.entities),
+                intents=intents,
+                tick_number=self._tick_number,
+            )
 
-                # Apply entity changes
-                await self._apply_tick_result(zone, result, db)
+            # Apply entity changes (updates zone.entities in-memory too)
+            await self._apply_tick_result(zone, result, db)
 
-                # Broadcast state to subscribers
-                await self._broadcast_zone_state(zone, result)
+            # Build authoritative base_state from post-apply entities
+            base_state = self._build_base_state(zone)
 
-            except Exception as e:
-                logger.error(
-                    f"Game logic error in zone {zone.id}: {e}",
-                    exc_info=True,
-                )
+            # Merge in extras from game logic
+            base_state.update(result.extras)
+
+            # Broadcast state to subscribers (with per-player filtering)
+            await self._broadcast_zone_state(zone, base_state)
         else:
             # No game logic - just broadcast basic state
             await self._broadcast_basic_state(zone)
@@ -270,7 +273,14 @@ class TickEngine:
         return len(intents)
 
     async def _apply_tick_result(self, zone: Zone, result, db) -> None:
-        """Apply entity changes from tick result."""
+        """
+        Apply entity changes from tick result.
+        Updates both DB and in-memory zone.entities for same-tick correctness.
+        """
+        # Track entities to add/remove from in-memory list
+        new_entities: list[Entity] = []
+        deleted_ids: set[UUID] = set(result.entity_deletes)
+
         # Create new entities
         for create in result.entity_creates:
             entity = Entity(
@@ -282,6 +292,7 @@ class TickEngine:
                 metadata_=create.metadata,
             )
             db.add(entity)
+            new_entities.append(entity)
 
         # Update existing entities
         for update in result.entity_updates:
@@ -308,8 +319,43 @@ class TickEngine:
 
         await db.commit()
 
-    async def _broadcast_zone_state(self, zone: Zone, result) -> None:
-        """Broadcast tick state to zone subscribers."""
+        # Update in-memory entity list for same-tick correctness
+        # Remove deleted entities and add new ones
+        if deleted_ids or new_entities:
+            # Filter out deleted entities
+            remaining = [e for e in zone.entities if e.id not in deleted_ids]
+            # Add new entities
+            remaining.extend(new_entities)
+            # SQLAlchemy collections need careful handling - replace contents
+            zone.entities.clear()
+            zone.entities.extend(remaining)
+
+    def _build_base_state(self, zone: Zone) -> dict[str, Any]:
+        """
+        Build authoritative base_state from post-apply entities.
+        This is the framework-owned entity snapshot.
+        """
+        return {
+            "zone_id": str(zone.id),
+            "tick_number": self._tick_number,
+            "entities": [
+                {
+                    "id": str(e.id),
+                    "x": e.x,
+                    "y": e.y,
+                    "width": e.width,
+                    "height": e.height,
+                    "metadata": e.metadata_,
+                }
+                for e in zone.entities
+            ],
+        }
+
+    async def _broadcast_zone_state(self, zone: Zone, full_state: dict[str, Any]) -> None:
+        """
+        Broadcast tick state to zone subscribers.
+        Calls get_player_state for each subscriber to apply fog-of-war filtering.
+        """
         from grid_backend.websocket import get_connection_manager
 
         manager = get_connection_manager()
@@ -319,14 +365,14 @@ class TickEngine:
         subscribers = await manager.get_zone_subscribers(zone.id)
 
         for sub in subscribers:
-            # Get player-specific state if game logic supports it
-            state = result.broadcast_state
+            # Get player-specific state via fog-of-war hook
+            state = full_state
             if self._game_logic is not None:
                 try:
                     state = self._game_logic.get_player_state(
                         zone_id=zone.id,
                         player_id=sub.player_id,
-                        full_state=result.broadcast_state,
+                        full_state=full_state,
                     )
                 except Exception as e:
                     logger.warning(

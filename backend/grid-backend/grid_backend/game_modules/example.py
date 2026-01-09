@@ -3,6 +3,13 @@ Example game logic module demonstrating the module interface.
 
 This module implements a simple movement system where players can move
 entities around the grid via intents.
+
+Note: The framework owns the authoritative entity snapshot. This module returns:
+- Entity deltas (creates/updates/deletes) which the framework persists
+- Extras (non-entity payload like events) which the framework merges into broadcast
+
+The framework builds the entity snapshot from post-apply DB state and passes
+it to get_player_state for fog-of-war filtering.
 """
 
 import logging
@@ -83,28 +90,20 @@ class ExampleGameModule:
                     f"Error processing intent from {intent.player_id}: {e}"
                 )
 
-        # Build broadcast state
-        state = {
-            "zone_id": str(zone_id),
-            "tick": tick_number,
-            "entities": [
-                {
-                    "id": str(e.id),
-                    "x": e.x,
-                    "y": e.y,
-                    "width": e.width,
-                    "height": e.height,
-                    "metadata": e.metadata_,
-                }
-                for e in entities
-            ],
-        }
+        # Build extras (non-entity payload)
+        # NOTE: Do NOT include entity snapshot here - framework builds that
+        extras: dict[str, Any] = {}
+
+        # Example: could add game-specific events here
+        if creates:
+            extras["events"] = extras.get("events", [])
+            extras["events"].append({"type": "entities_created", "count": len(creates)})
 
         return TickResult(
             entity_creates=creates,
             entity_updates=updates,
             entity_deletes=deletes,
-            broadcast_state=state,
+            extras=extras,
         )
 
     def _handle_move(
@@ -200,13 +199,24 @@ class ExampleGameModule:
         full_state: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Get player-specific state.
-        Adds player_id to state to demonstrate per-player filtering.
-        In a real game, this could implement fog-of-war or hide certain entities.
+        Get player-specific state (fog-of-war hook).
+
+        full_state contains:
+        - zone_id, tick_number (from framework)
+        - entities: authoritative snapshot built by framework
+        - any extras from on_tick
+
+        In a real game, this could:
+        - Filter entities by visibility/distance
+        - Hide certain entity metadata
+        - Add player-specific data
         """
         # Copy state and add player-specific info
         player_state = dict(full_state)
         player_state["viewer_id"] = str(player_id)
+
+        # Example fog-of-war: could filter entities here based on player position
+        # For now, just pass through all entities
         return player_state
 
 

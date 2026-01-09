@@ -165,18 +165,14 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(info)
 
     # Create handler and process messages
+    # Handler owns the disconnect path (passes connection_id for safety)
     handler = WebSocketHandler(
         manager=manager,
         info=info,
         db_session_factory=async_session_factory,
     )
 
-    try:
-        await handler.handle_connection()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await manager.disconnect(info.player_id)
+    await handler.handle_connection()
 
 
 # Health check endpoint
