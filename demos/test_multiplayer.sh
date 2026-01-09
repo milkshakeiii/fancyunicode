@@ -6,18 +6,31 @@
 # Starts the backend server and launches N client windows.
 # Default: 2 clients
 #
+# Requirements:
+# - gridtickmultiplayer repo cloned alongside fancyunicode
+# - Backend venv set up with dependencies
+#
 
 set -e
 
 NUM_CLIENTS=${1:-2}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+BACKEND_ROOT="/home/henry/Documents/github/gridtickmultiplayer"
 PYUNICODE_PATH="/home/henry/Documents/github/pyunicodegame/src"
 
 echo "=== Multiplayer Grid Demo Test ==="
 echo "Clients: $NUM_CLIENTS"
 echo "Project root: $PROJECT_ROOT"
+echo "Backend root: $BACKEND_ROOT"
 echo ""
+
+# Check backend repo exists
+if [ ! -d "$BACKEND_ROOT" ]; then
+    echo "ERROR: Backend repo not found at $BACKEND_ROOT"
+    echo "Clone it with: gh repo clone milkshakeiii/gridtickmultiplayer"
+    exit 1
+fi
 
 # Cleanup function
 cleanup() {
@@ -51,7 +64,7 @@ fi
 
 # Start backend (using venv)
 echo "Starting backend server..."
-cd "$SCRIPT_DIR"
+cd "$BACKEND_ROOT"
 source venv/bin/activate
 python -m grid_backend.main > /tmp/grid_backend_test.log 2>&1 &
 BACKEND_PID=$!
