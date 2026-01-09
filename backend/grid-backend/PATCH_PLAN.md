@@ -4,6 +4,7 @@
 
 - **Database**: Make SQLite the official/default DB for now (easy setup); Postgres can be revisited later.
 - **Game module contract**: Framework owns the authoritative entity snapshot. Game modules return entity deltas + non-entity `extras/events`. Per-player visibility is enforced server-side via `get_player_state` (fog-of-war/redaction).
+- **Error handling (dev)**: Fail fast on internal errors (tick loop, game logic, DB mutations). Expected network/protocol errors (disconnects, timeouts, invalid client messages) should not crash the server.
 - **Compatibility/migration**: None needed (new project).
 
 ## Phase 1 — Docs/config align to SQLite
@@ -42,11 +43,16 @@
 - Update `grid_backend/tick_engine/engine.py` so intent enqueue/dequeue can’t race (make `queue_intent` lock-protected; likely `async def queue_intent(...)` using `_intent_lock`).
 - Update `grid_backend/websocket/handler.py` to `await` intent enqueue before acknowledging `intent_received`.
 
-## Phase 5 — Per-zone DB error isolation (real isolation)
+## Phase 5 — Fail-fast on internal errors (dev)
 
-- Update `grid_backend/tick_engine/engine.py` so each zone’s processing runs in its own transaction/session boundary:
-  - a failure in one zone rolls back only that zone’s work and does not poison subsequent zones in the same tick.
-- Remove “commit inside apply helper” and commit/rollback at the zone boundary consistently.
+- Update `grid_backend/tick_engine/engine.py` to stop swallowing exceptions in the tick loop / zone processing / game logic; let errors propagate.
+- Ensure a tick-task failure takes down the server (not just “silently stops ticking”) so bugs are immediately visible during development.
+- Narrow exception handling to *expected* network/protocol failures only (non-fatal):
+  - WebSocket disconnects (`WebSocketDisconnect`)
+  - send timeouts (`asyncio.TimeoutError`)
+  - connection reset/broken pipe type I/O failures (best-effort cleanup)
+  - invalid client messages (missing fields/unknown message types) should yield an error response, not a process crash.
+  - invalid JSON payloads should **close immediately** with an appropriate WebSocket close code (e.g. 1007) and not be treated as internal errors.
 
 ## Phase 6 — Reconnect safety (prevent old connection from killing the new one)
 
@@ -75,6 +81,6 @@
 - Server boots from scratch with SQLite using the documented steps.
 - Tick messages include an entity snapshot consistent with the post-apply DB state for that tick (no 1-tick lag for creates/deletes).
 - No client receives unfiltered/full state if the module redacts via `get_player_state`.
+- Internal (server-side) logic errors crash the server in dev; expected network/protocol failures do not.
 - Reconnect cannot cause a stale socket to disconnect the new session.
 - Tick engine doesn’t load/process every zone when only a few are active.
-
