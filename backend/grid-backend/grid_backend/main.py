@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     # Load game logic module
     logger.info(f"Loading game module: {settings.game_module}")
     framework = FrameworkAPI(async_session_factory)
-    game_logic = load_game_module(settings.game_module, framework)
+    game_logic = await load_game_module(settings.game_module, framework)
 
     # Initialize tick engine
     logger.info(f"Starting tick engine (rate: {settings.tick_rate_ms}ms)...")

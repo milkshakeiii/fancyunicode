@@ -289,6 +289,7 @@ class TickEngine:
                 y=create.y,
                 width=create.width,
                 height=create.height,
+                owner_id=create.owner_id,
                 metadata_=create.metadata,
             )
             db.add(entity)
@@ -345,6 +346,7 @@ class TickEngine:
                     "y": e.y,
                     "width": e.width,
                     "height": e.height,
+                    "owner_id": str(e.owner_id) if e.owner_id else None,
                     "metadata": e.metadata_,
                 }
                 for e in zone.entities
@@ -406,6 +408,7 @@ class TickEngine:
                     "y": e.y,
                     "width": e.width,
                     "height": e.height,
+                    "owner_id": str(e.owner_id) if e.owner_id else None,
                     "metadata": e.metadata_,
                 }
                 for e in zone.entities

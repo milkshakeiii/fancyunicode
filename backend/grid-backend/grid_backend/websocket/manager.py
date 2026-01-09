@@ -145,6 +145,20 @@ class ConnectionManager:
             )
             return
 
+        # Queue synthetic disconnect intent if player was in a zone
+        if info.zone_id is not None:
+            from grid_backend.tick_engine import get_tick_engine
+            engine = get_tick_engine()
+            if engine is not None:
+                await engine.queue_intent(
+                    zone_id=info.zone_id,
+                    player_id=player_id,
+                    data={"action": "owner_disconnect", "player_id": str(player_id)},
+                )
+                logger.info(
+                    f"Queued owner_disconnect intent for player {player_id} in zone {info.zone_id}"
+                )
+
         # Remove from zone subscriptions
         await self._unsubscribe_internal(info)
 

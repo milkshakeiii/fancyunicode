@@ -11,7 +11,7 @@ from grid_backend.game_logic.protocol import GameLogicModule, FrameworkAPI
 logger = logging.getLogger(__name__)
 
 
-def load_game_module(
+async def load_game_module(
     module_path: str,
     framework: FrameworkAPI,
 ) -> GameLogicModule | None:
@@ -52,8 +52,8 @@ def load_game_module(
         else:
             instance = game_class()
 
-        # Initialize the module
-        instance.on_init(framework)
+        # Initialize the module (async)
+        await instance.on_init(framework)
 
         logger.info(f"Loaded game logic module: {module_path}")
         return instance

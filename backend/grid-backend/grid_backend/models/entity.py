@@ -35,6 +35,12 @@ class Entity(Base):
         index=True,
         nullable=False,
     )
+    owner_id: Mapped[Uuid | None] = mapped_column(
+        Uuid,
+        ForeignKey("players.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     x: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

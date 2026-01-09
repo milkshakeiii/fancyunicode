@@ -30,6 +30,7 @@ class EntityCreate:
     y: int
     width: int = 0
     height: int = 0
+    owner_id: UUID | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,6 +76,48 @@ class FrameworkAPI:
     def __init__(self, db_session_factory) -> None:
         self._db_session_factory = db_session_factory
 
+    async def get_zones(self) -> list:
+        """Get all zones."""
+        from sqlalchemy import select
+        from grid_backend.models.zone import Zone
+
+        async with self._db_session_factory() as db:
+            result = await db.execute(select(Zone))
+            return list(result.scalars().all())
+
+    async def get_zone_by_name(self, name: str):
+        """Get a zone by name."""
+        from sqlalchemy import select
+        from grid_backend.models.zone import Zone
+
+        async with self._db_session_factory() as db:
+            result = await db.execute(
+                select(Zone).where(Zone.name == name)
+            )
+            return result.scalar_one_or_none()
+
+    async def create_zone(
+        self,
+        name: str,
+        width: int = 100,
+        height: int = 100,
+        metadata: dict[str, Any] | None = None,
+    ):
+        """Create a new zone. Returns the created zone."""
+        from grid_backend.models.zone import Zone
+
+        async with self._db_session_factory() as db:
+            zone = Zone(
+                name=name,
+                width=width,
+                height=height,
+                metadata_=metadata or {},
+            )
+            db.add(zone)
+            await db.commit()
+            await db.refresh(zone)
+            return zone
+
     async def get_zone_entities(self, zone_id: UUID) -> list[Entity]:
         """Get all entities in a zone."""
         from sqlalchemy import select
@@ -97,6 +140,18 @@ class FrameworkAPI:
             )
             return result.scalar_one_or_none()
 
+    async def delete_entity(self, entity_id: UUID) -> bool:
+        """Delete an entity by ID. Returns True if deleted, False if not found."""
+        from sqlalchemy import delete
+        from grid_backend.models.entity import Entity
+
+        async with self._db_session_factory() as db:
+            result = await db.execute(
+                delete(Entity).where(Entity.id == entity_id)
+            )
+            await db.commit()
+            return result.rowcount > 0
+
 
 @runtime_checkable
 class GameLogicModule(Protocol):
@@ -104,10 +159,10 @@ class GameLogicModule(Protocol):
     Protocol that game logic modules must implement.
     """
 
-    def on_init(self, framework: FrameworkAPI) -> None:
+    async def on_init(self, framework: FrameworkAPI) -> None:
         """
         Called once when the module is loaded.
-        Use to set up initial state or resources.
+        Use to set up initial state or resources (e.g., create zones).
         """
         ...
 

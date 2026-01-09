@@ -37,14 +37,40 @@ class ExampleGameModule:
     - {"action": "move", "entity_id": "...", "dx": 1, "dy": 0}
     - {"action": "create_entity", "x": 0, "y": 0, "width": 1, "height": 1}
     - {"action": "delete_entity", "entity_id": "..."}
+    - {"action": "owner_disconnect", "player_id": "..."} (synthetic, from framework)
     """
 
-    def __init__(self) -> None:
-        self._framework: FrameworkAPI | None = None
+    # Default zone configuration
+    DEFAULT_ZONE_NAME = "demo"
+    DEFAULT_ZONE_WIDTH = 60
+    DEFAULT_ZONE_HEIGHT = 35
 
-    def on_init(self, framework: FrameworkAPI) -> None:
-        """Initialize the module."""
-        self._framework = framework
+    async def on_init(self, framework: FrameworkAPI) -> None:
+        """Initialize the module and ensure default zone exists."""
+
+        # Create default zone if it doesn't exist
+        zone = await framework.get_zone_by_name(self.DEFAULT_ZONE_NAME)
+        if zone is None:
+            zone = await framework.create_zone(
+                name=self.DEFAULT_ZONE_NAME,
+                width=self.DEFAULT_ZONE_WIDTH,
+                height=self.DEFAULT_ZONE_HEIGHT,
+            )
+            logger.info(f"Created default zone '{self.DEFAULT_ZONE_NAME}' ({zone.id})")
+        else:
+            logger.info(f"Using existing zone '{self.DEFAULT_ZONE_NAME}' ({zone.id})")
+
+        # Clean up orphan entities from previous sessions
+        # At startup, no players are connected, so any owned entity is stale
+        entities = await framework.get_zone_entities(zone.id)
+        orphan_count = 0
+        for entity in entities:
+            if entity.owner_id is not None:
+                await framework.delete_entity(entity.id)
+                orphan_count += 1
+        if orphan_count > 0:
+            logger.info(f"Cleaned up {orphan_count} orphan entities from previous session")
+
         logger.info("Example game module initialized")
 
     def on_tick(
@@ -84,6 +110,11 @@ class ExampleGameModule:
                     entity_id = self._handle_delete_entity(intent, entity_map)
                     if entity_id is not None:
                         deletes.append(entity_id)
+
+                elif action == "owner_disconnect":
+                    # Delete all entities owned by the disconnecting player
+                    disconnected_ids = self._handle_owner_disconnect(intent, entities)
+                    deletes.extend(disconnected_ids)
 
             except Exception as e:
                 logger.warning(
@@ -189,8 +220,36 @@ class ExampleGameModule:
             y=y,
             width=width,
             height=height,
+            owner_id=intent.player_id,  # Set owner to the player creating the entity
             metadata=metadata,
         )
+
+    def _handle_owner_disconnect(
+        self,
+        intent: Intent,
+        entities: list[Entity],
+    ) -> list[UUID]:
+        """
+        Handle owner disconnect - delete all entities owned by the player.
+        This is a synthetic intent queued by the framework when a player disconnects.
+        """
+        player_id_str = intent.data.get("player_id")
+        if player_id_str is None:
+            return []
+
+        try:
+            player_id = UUID(player_id_str)
+        except ValueError:
+            return []
+
+        # Find all entities owned by this player
+        to_delete = []
+        for entity in entities:
+            if entity.owner_id == player_id:
+                to_delete.append(entity.id)
+                logger.info(f"Deleting entity {entity.id} owned by disconnected player {player_id}")
+
+        return to_delete
 
     def get_player_state(
         self,
