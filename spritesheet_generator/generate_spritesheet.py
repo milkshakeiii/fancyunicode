@@ -61,7 +61,7 @@ def generate_base_sprite(
     output_path: Path,
     target_width: int = 20,
     target_height: int = 20,
-    style: str = "pixel art",
+    style: str = "simple cartoon",
     view: str = "side view",
 ) -> Path:
     """Generate a base sprite using Gemini image generation."""
@@ -69,10 +69,12 @@ def generate_base_sprite(
 
     client = genai.Client()
 
-    prompt = f"""Create a {target_width}x{target_height} pixel {style} sprite of a {subject}, {view}.
-The sprite should be on a solid bright green (#00FF00) background for easy chroma keying.
+    prompt = f"""Create a {style} of a {subject}, {view}.
+The image should be on a solid bright green (#00FF00) background for easy chroma keying.
 The character should be centered and facing right.
-Simple, clean pixel art style suitable for a 2D game. Keep details bold and simple for the small size.
+Use flat solid colors with no gradients, shading, or anti-aliasing.
+Bold black outlines and distinct color regions.
+Keep shapes simple and colors distinct.
 No shadows on the green background.
 The green background should be completely uniform #00FF00.
 The entire image should be filled with the green background, edge to edge, no white or other colors."""
@@ -130,7 +132,8 @@ def generate_animation_video(
 Keep the character on the green background.
 Smooth looping animation.
 The character should stay centered in frame.
-Maintain the pixel art style."""
+Maintain flat solid colors with no gradients or shading.
+Keep the simple cartoon style with bold outlines."""
 
     print(f"Generating animation with prompt:\n{full_prompt}\n")
 
@@ -591,7 +594,7 @@ def generate_spritesheet(
     print("\n" + "=" * 60)
     print("STEP 2: Generating animation video...")
     print("=" * 60)
-    animation_prompt = f"Animate this {target_width}x{target_height} pixel sprite doing a {animation_type}."
+    animation_prompt = f"Animate this sprite doing a {animation_type}."
     generate_animation_video(
         base_sprite_path,
         animation_path,
