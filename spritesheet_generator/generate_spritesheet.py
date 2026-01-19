@@ -71,10 +71,12 @@ def generate_base_sprite(
 
     prompt = f"""Create a {style} of a {subject}, {view}.
 The image should be on a solid bright green (#00FF00) background for easy chroma keying.
-The character should be centered and facing right.
+The character should be centered and facing right. The character should be entirely in frame.
 Use flat solid colors with no gradients, shading, or anti-aliasing.
 NO outlines. Extremely simple shapes only.
 Eyes should be large simple circles, no eyelids or pupils.
+No facial details other than eyes. No two details should be close to one another.
+All features must be thick and blocky. No thin lines - items, clothing, limbs should be as wide as the character's head.
 Large solid color regions, minimal color count.
 No shadows on the green background.
 The green background should be completely uniform #00FF00.
