@@ -73,8 +73,9 @@ def generate_base_sprite(
 The image should be on a solid bright green (#00FF00) background for easy chroma keying.
 The character should be centered and facing right.
 Use flat solid colors with no gradients, shading, or anti-aliasing.
-Bold black outlines and distinct color regions.
-Keep shapes simple and colors distinct.
+NO outlines. Extremely simple shapes only.
+Eyes should be large simple circles, no eyelids or pupils.
+Large solid color regions, minimal color count.
 No shadows on the green background.
 The green background should be completely uniform #00FF00.
 The entire image should be filled with the green background, edge to edge, no white or other colors."""
@@ -131,9 +132,10 @@ def generate_animation_video(
     full_prompt = f"""{animation_prompt}
 Keep the character on the green background.
 Smooth looping animation.
-The character should stay centered in frame.
+The character must stay perfectly centered in frame - no movement or drifting across the screen.
+The character animates in place without changing position.
 Maintain flat solid colors with no gradients or shading.
-Keep the simple cartoon style with bold outlines."""
+Keep extremely simple shapes with no fine details or outlines."""
 
     print(f"Generating animation with prompt:\n{full_prompt}\n")
 
@@ -405,32 +407,23 @@ def union_bbox(bboxes: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, 
     return (x_min, y_min, x_max, y_max)
 
 
-def process_frames(
+def preprocess_frames(
     frame_paths: List[Path],
-    output_dir: Path,
-    target_width: int,
-    target_height: int,
     green_tolerance: int,
-    downsample_mode: str,
-    transparency_threshold: int,
     verbose: bool = True,
-) -> List[Path]:
-    """Process all frames with consistent cropping across the batch."""
-
-    # Pass 1: Remove letterbox and green, collect bounding boxes
+) -> Tuple[List[Image.Image], List[Tuple[int, int, int, int]]]:
+    """Pass 1: Remove backgrounds and collect bounding boxes."""
     if verbose:
-        print("  Pass 1: Removing backgrounds and finding content bounds...")
+        print("  Removing backgrounds and finding content bounds...")
 
     processed_images = []
     bboxes = []
 
     for frame_path in frame_paths:
         img = Image.open(frame_path).convert("RGBA")
-        orig_size = img.size
 
         # Remove letterbox bars
         img = remove_letterbox(img, verbose=False)
-        letterbox_size = img.size
 
         # Remove green background
         img = remove_green_background(img, tolerance=green_tolerance)
@@ -438,33 +431,30 @@ def process_frames(
         # Get content bounding box
         bbox = get_content_bbox(img)
 
-        if verbose:
-            letterbox_removed = orig_size[1] - letterbox_size[1]
-            print(f"    {frame_path.name}: {orig_size[0]}x{orig_size[1]}, letterbox: {letterbox_removed}px, bbox: {bbox}")
-
         processed_images.append(img)
         if bbox:
             bboxes.append(bbox)
 
-    if not bboxes:
-        raise ValueError("No content found in any frame")
+    return processed_images, bboxes
 
-    # Compute union bounding box
-    final_bbox = union_bbox(bboxes)
-    crop_width = final_bbox[2] - final_bbox[0] + 1
-    crop_height = final_bbox[3] - final_bbox[1] + 1
 
+def finalize_frames(
+    processed_images: List[Image.Image],
+    output_dir: Path,
+    final_bbox: Tuple[int, int, int, int],
+    target_width: int,
+    target_height: int,
+    downsample_mode: str,
+    transparency_threshold: int,
+    verbose: bool = True,
+) -> List[Path]:
+    """Pass 2: Crop to bbox and downsample."""
     if verbose:
-        print(f"\n  Union bounding box: x={final_bbox[0]}-{final_bbox[2]}, y={final_bbox[1]}-{final_bbox[3]}")
-        print(f"  Content size: {crop_width}x{crop_height}")
-
-    # Pass 2: Crop and downsample
-    if verbose:
-        print(f"\n  Pass 2: Cropping to union bbox and downsampling to {target_width}x{target_height}...")
+        print(f"  Cropping and downsampling to {target_width}x{target_height}...")
 
     output_paths = []
     for i, img in enumerate(processed_images):
-        # Crop to union bbox
+        # Crop to bbox
         img = img.crop((final_bbox[0], final_bbox[1], final_bbox[2] + 1, final_bbox[3] + 1))
 
         # Downsample
@@ -480,10 +470,37 @@ def process_frames(
         img.save(output_path)
         output_paths.append(output_path)
 
-    if verbose:
-        print(f"  Processed {len(output_paths)} frames")
-
     return output_paths
+
+
+def process_frames(
+    frame_paths: List[Path],
+    output_dir: Path,
+    target_width: int,
+    target_height: int,
+    green_tolerance: int,
+    downsample_mode: str,
+    transparency_threshold: int,
+    verbose: bool = True,
+) -> List[Path]:
+    """Process all frames with consistent cropping across the batch."""
+    processed_images, bboxes = preprocess_frames(frame_paths, green_tolerance, verbose)
+
+    if not bboxes:
+        raise ValueError("No content found in any frame")
+
+    # Compute union bounding box
+    final_bbox = union_bbox(bboxes)
+    crop_width = final_bbox[2] - final_bbox[0] + 1
+    crop_height = final_bbox[3] - final_bbox[1] + 1
+
+    if verbose:
+        print(f"  Union bbox: {crop_width}x{crop_height}")
+
+    return finalize_frames(
+        processed_images, output_dir, final_bbox,
+        target_width, target_height, downsample_mode, transparency_threshold, verbose
+    )
 
 
 # =============================================================================
@@ -658,22 +675,172 @@ def generate_spritesheet(
 
 
 # =============================================================================
+# MULTI-ANIMATION SPRITESHEET
+# =============================================================================
+
+def generate_multi_animation_spritesheet(
+    character: str,
+    animations: List[str],
+    target_width: int,
+    target_height: int,
+    frame_count: int,
+    video_duration: int,
+    green_tolerance: int,
+    downsample_mode: str,
+    transparency_threshold: int,
+    output_dir: Path,
+) -> Path:
+    """Generate a multi-row spritesheet with idle + requested animations."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Always include idle as first animation
+    all_animations = ["idle"] + [a for a in animations if a.lower() != "idle"]
+
+    print("=" * 60)
+    print(f"Generating spritesheet for: {character}")
+    print(f"Animations: {', '.join(all_animations)}")
+    print("=" * 60)
+
+    # Step 1: Generate base sprite
+    print("\n" + "=" * 60)
+    print("STEP 1: Generating base sprite...")
+    print("=" * 60)
+    base_sprite_path = output_dir / "01_base_sprite.png"
+    generate_base_sprite(character, base_sprite_path, target_width, target_height)
+
+    # Step 2: Generate all videos and extract frames
+    anim_data = []  # List of (anim_dir, frames_dir, frame_paths)
+
+    for i, anim_type in enumerate(all_animations):
+        print("\n" + "=" * 60)
+        print(f"GENERATING {i + 1}/{len(all_animations)}: {anim_type}")
+        print("=" * 60)
+
+        anim_dir = output_dir / f"anim_{i:02d}_{anim_type}"
+        anim_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate video
+        animation_path = anim_dir / "animation.mp4"
+        animation_prompt = f"Animate this sprite doing a {anim_type} animation in place."
+        print(f"  Generating animation: {anim_type}...")
+        generate_animation_video(
+            base_sprite_path,
+            animation_path,
+            animation_prompt,
+            duration_seconds=video_duration,
+        )
+
+        # Extract frames
+        frames_dir = anim_dir / "frames"
+        print(f"  Extracting frames...")
+        frames = extract_frames(animation_path, frames_dir, frame_count)
+
+        anim_data.append((anim_type, anim_dir, frames))
+
+    # Step 3: Preprocess all frames and find global bounding box
+    print("\n" + "=" * 60)
+    print("PROCESSING: Finding global bounding box across all animations...")
+    print("=" * 60)
+
+    all_preprocessed = []  # List of (anim_type, anim_dir, processed_images)
+    all_bboxes = []
+
+    for anim_type, anim_dir, frames in anim_data:
+        print(f"  Preprocessing {anim_type}...")
+        processed_images, bboxes = preprocess_frames(frames, green_tolerance, verbose=False)
+        all_preprocessed.append((anim_type, anim_dir, processed_images))
+        all_bboxes.extend(bboxes)
+
+    if not all_bboxes:
+        raise ValueError("No content found in any frame")
+
+    global_bbox = union_bbox(all_bboxes)
+    crop_width = global_bbox[2] - global_bbox[0] + 1
+    crop_height = global_bbox[3] - global_bbox[1] + 1
+    print(f"  Global bounding box: {crop_width}x{crop_height}")
+
+    # Step 4: Finalize frames with global bbox and assemble rows
+    print("\n" + "=" * 60)
+    print("FINALIZING: Cropping and assembling spritesheets...")
+    print("=" * 60)
+
+    row_spritesheets = []
+    for anim_type, anim_dir, processed_images in all_preprocessed:
+        print(f"  Finalizing {anim_type}...")
+        processed_dir = anim_dir / "processed"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+
+        processed_frames = finalize_frames(
+            processed_images, processed_dir, global_bbox,
+            target_width, target_height, downsample_mode, transparency_threshold,
+            verbose=False,
+        )
+
+        # Assemble row spritesheet
+        row_sheet_path = anim_dir / "row.png"
+        row_sheet_path, _ = assemble_spritesheet(processed_frames, row_sheet_path)
+        row_spritesheets.append(row_sheet_path)
+
+    # Combine all rows into final spritesheet
+    print("\n" + "=" * 60)
+    print("FINAL: Combining rows into multi-animation spritesheet...")
+    print("=" * 60)
+
+    row_images = [Image.open(p) for p in row_spritesheets]
+    max_width = max(img.width for img in row_images)
+    total_height = sum(img.height for img in row_images)
+
+    combined = Image.new("RGBA", (max_width, total_height), (0, 0, 0, 0))
+    y = 0
+    for img in row_images:
+        combined.paste(img, (0, y))
+        y += img.height
+
+    final_path = output_dir / "spritesheet.png"
+    combined.save(final_path)
+
+    # Save metadata
+    metadata = {
+        "character": character,
+        "animations": all_animations,
+        "frame_width": target_width,
+        "frame_height": target_height,
+        "frame_count": frame_count,
+        "rows": len(all_animations),
+        "cols": frame_count,
+        "total_width": max_width,
+        "total_height": total_height,
+    }
+    metadata_path = output_dir / "metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\nSaved spritesheet: {final_path}")
+    print(f"  Size: {max_width}x{total_height}")
+    print(f"  Rows: {len(all_animations)} ({', '.join(all_animations)})")
+    print(f"  Cols: {frame_count} frames per animation")
+    print(f"Saved metadata: {metadata_path}")
+
+    return final_path
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate pixel-art spritesheets using Gemini and Veo",
+        description="Generate multi-animation spritesheets using Gemini and Veo",
     )
     parser.add_argument(
-        "--subject",
-        default=SUBJECT,
-        help=f"Subject to generate (default: {SUBJECT})",
+        "character",
+        help="Character to generate (e.g., 'minotaur', 'wizard')",
     )
     parser.add_argument(
-        "--animation",
-        default=ANIMATION_TYPE,
-        help=f"Animation type (default: {ANIMATION_TYPE})",
+        "animations",
+        nargs="*",
+        default=["walk"],
+        help="Animation types (e.g., 'walk attack death'). Idle is always included as first row.",
     )
     parser.add_argument(
         "--width",
@@ -691,7 +858,7 @@ def main():
         "--frames",
         type=int,
         default=FRAME_COUNT,
-        help=f"Number of frames to extract (default: {FRAME_COUNT})",
+        help=f"Number of frames per animation (default: {FRAME_COUNT})",
     )
     parser.add_argument(
         "--duration",
@@ -715,31 +882,19 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=OUTPUT_DIR,
-        help=f"Output directory (default: {OUTPUT_DIR})",
-    )
-    parser.add_argument(
-        "--base-sprite",
-        type=Path,
         default=None,
-        help="Path to existing base sprite (skip generation step)",
+        help="Output directory (default: output/<character>)",
     )
     args = parser.parse_args()
-
-    # Default to sprite-only when generating a new sprite (no --base-sprite)
-    # This lets you review the sprite before animating
-    if args.base_sprite is None:
-        args.sprite_only = True
-    else:
-        args.sprite_only = False
 
     # Check for API key (accept either name)
     if not os.environ.get("GOOGLE_API_KEY") and not os.environ.get("GEMINI_API_KEY"):
         print("Error: GOOGLE_API_KEY or GEMINI_API_KEY environment variable not set")
         print("Get an API key from https://aistudio.google.com/")
         sys.exit(1)
-    # google-genai uses GOOGLE_API_KEY, so copy GEMINI_API_KEY if needed
-    if not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
+    if os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
+        print("Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.")
+    elif not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
         os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
     # Check for ffmpeg
@@ -748,9 +903,12 @@ def main():
         print("Install with: sudo apt install ffmpeg")
         sys.exit(1)
 
-    generate_spritesheet(
-        subject=args.subject,
-        animation_type=args.animation,
+    # Default output dir based on character name
+    output_dir = args.output_dir or (OUTPUT_DIR / args.character.replace(" ", "_"))
+
+    generate_multi_animation_spritesheet(
+        character=args.character,
+        animations=args.animations,
         target_width=args.width,
         target_height=args.height,
         frame_count=args.frames,
@@ -758,9 +916,7 @@ def main():
         green_tolerance=args.green_tolerance,
         downsample_mode=args.downsample_mode,
         transparency_threshold=TRANSPARENCY_THRESHOLD,
-        output_dir=args.output_dir,
-        base_sprite=args.base_sprite,
-        sprite_only=args.sprite_only,
+        output_dir=output_dir,
     )
 
 
