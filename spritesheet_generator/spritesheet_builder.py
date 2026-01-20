@@ -2,23 +2,40 @@
 """
 Spritesheet Builder
 
-Builds spritesheets using Gemini image generation and pixelgrid.py extraction.
-Supports additive building across multiple calls.
+Builds spritesheets using Gemini image generation and pixelgrid extraction.
+Generates consistent pixel art animations with automatic palette management.
 
-Usage:
-    python3 spritesheet_builder.py init <project_dir> <character_prompt> [--cell-size WxH] [--resolution WxH] [--no-quantize]
-    python3 spritesheet_builder.py add-frame <project_dir> <animation> <frame_prompt> [--no-quantize]
-    python3 spritesheet_builder.py build <project_dir>
-    python3 spritesheet_builder.py show <project_dir>
-    python3 spritesheet_builder.py quantize <project_dir> [--colors N]
+Example workflow:
+    # 1. Create project with base sprite
+    python3 spritesheet_builder.py init output/warrior "a warrior with sword and shield" \\
+        --style "Few colors and simple shapes"
 
-Options:
-    --cell-size WxH    Frame dimensions will be multiples of this (default: 10x20)
-    --resolution WxH   Hint for Gemini about desired sprite size (default: 2 cells wide x 1 cell tall)
-    --no-quantize      Skip automatic palette quantization (init/add-frame)
-    --colors N         Number of colors for palette (default: auto-detect)
+    # 2. Add animation frames
+    python3 spritesheet_builder.py add-frame output/warrior idle "eyes closed, blinking"
+    python3 spritesheet_builder.py add-frame output/warrior walk "left foot forward"
+    python3 spritesheet_builder.py add-frame output/warrior walk "right foot forward"
 
-Requires GOOGLE_API_KEY environment variable to be set.
+    # 3. Build spritesheet
+    python3 spritesheet_builder.py build output/warrior
+
+    # 4. Preview animation
+    python3 demo_spritesheet.py output/warrior
+
+Init options:
+    --style TEXT        Extra style instructions (e.g., "Few colors and simple shapes")
+    --sensitivity N     Color detection sensitivity, higher = more colors (default: 2.5)
+    --colors N          Force specific palette size (default: auto-detect)
+    --cell-size WxH     Frame size rounding (default: 10x20)
+    --resolution WxH    Gemini size hint (default: 20x20)
+
+Project structure:
+    output/warrior/
+    ├── raw/                    # Gemini outputs and references
+    ├── frames/                 # Extracted pixel art frames
+    ├── metadata.json           # Project config and palette
+    └── spritesheet.png         # Final spritesheet (after build)
+
+Requires GOOGLE_API_KEY or GEMINI_API_KEY environment variable.
 """
 
 import argparse
@@ -65,6 +82,12 @@ No shadows on the green background.
 The green background should be completely uniform #00FF00.
 The entire image should be filled with the green background, edge to edge, no white or other colors."""
 
+# For animation frames - no margin requirements since limbs may extend
+FRAME_STYLE_PROMPT = """The image should be on a solid bright green (#00FF00) background for easy chroma keying.
+No shadows on the green background.
+The green background should be completely uniform #00FF00.
+The entire image should be filled with the green background, edge to edge, no white or other colors."""
+
 METADATA_FILENAME = "metadata.json"
 
 
@@ -77,7 +100,7 @@ def round_to_cell_multiple(size: Tuple[int, int], cell_size: Tuple[int, int]) ->
     cell_w, cell_h = cell_size
     w = ((size[0] + cell_w - 1) // cell_w) * cell_w
     h = ((size[1] + cell_h - 1) // cell_h) * cell_h
-    return (w, h)
+    return (int(w), int(h))
 
 
 def pad_frame_to_size(frame: Image.Image, target_size: Tuple[int, int]) -> Image.Image:
@@ -92,13 +115,21 @@ def pad_frame_to_size(frame: Image.Image, target_size: Tuple[int, int]) -> Image
 
 
 def expand_all_frames(project_dir: Path, metadata: dict, new_frame_size: Tuple[int, int]) -> None:
-    """Re-pad all existing frames to new_frame_size."""
+    """Re-extract all existing frames from raw images with new_frame_size."""
     frames_dir = project_dir / "frames"
+    raw_dir = project_dir / "raw"
     old_size = tuple(metadata["frame_size"])
 
     print(f"Expanding frames from {old_size[0]}x{old_size[1]} to {new_frame_size[0]}x{new_frame_size[1]}")
 
-    # Track which files we've already processed (some frames are shared)
+    # Get hint_cell_size from stored reference scale
+    reference_scale = metadata["reference_scale"]
+    hint_cell_size = (reference_scale, reference_scale)
+
+    # Get palette for re-quantization
+    palette = get_project_palette(project_dir)
+
+    # Track which files we've already processed
     processed_files = set()
 
     for anim_name, anim_data in metadata["animations"].items():
@@ -108,12 +139,22 @@ def expand_all_frames(project_dir: Path, metadata: dict, new_frame_size: Tuple[i
                 continue
             processed_files.add(extracted_filename)
 
+            raw_filename = frame_info["raw"]
+            raw_path = raw_dir / raw_filename
             frame_path = frames_dir / extracted_filename
-            if frame_path.exists():
-                frame_img = Image.open(frame_path).convert("RGBA")
-                padded = pad_frame_to_size(frame_img, new_frame_size)
-                padded.save(frame_path)
-                print(f"  Re-padded: {extracted_filename}")
+
+            if raw_path.exists():
+                # Re-extract from raw with new target size
+                print(f"  Re-extracting: {extracted_filename} from {raw_filename}")
+                _, _, _ = extract_sprite(raw_path, frame_path,
+                                         hint_cell_size=hint_cell_size,
+                                         target_frame_size=new_frame_size)
+
+                # Re-quantize to palette
+                if palette:
+                    frame_img = Image.open(frame_path).convert("RGBA")
+                    quantized = quantize_to_palette(frame_img, palette)
+                    quantized.save(frame_path)
 
     metadata["frame_size"] = list(new_frame_size)
 
@@ -122,8 +163,49 @@ def expand_all_frames(project_dir: Path, metadata: dict, new_frame_size: Tuple[i
 # GEMINI IMAGE GENERATION
 # =============================================================================
 
+def prepare_reference_image(sprite_path: Path, target_size: int = 1024) -> Tuple[bytes, int]:
+    """
+    Scale up a small sprite and place on green background for use as reference.
+
+    The sprite is scaled to fill 40% of the target size (30% margin on each side),
+    matching the STYLE_PROMPT instructions given to Gemini.
+
+    Returns (PNG image data as bytes, scale factor used).
+    """
+    sprite = Image.open(sprite_path).convert("RGBA")
+
+    # Calculate scale to fill 40% of target (30% margin on each side)
+    sprite_area = target_size * 0.4
+    scale = int(sprite_area / max(sprite.width, sprite.height))
+
+    # Scale up using nearest neighbor to preserve pixel art
+    scaled_size = (sprite.width * scale, sprite.height * scale)
+    scaled = sprite.resize(scaled_size, Image.Resampling.NEAREST)
+
+    # Create square green background
+    background = Image.new("RGBA", (target_size, target_size), (0, 255, 0, 255))
+
+    # Paste scaled sprite centered on background
+    paste_x = (target_size - scaled_size[0]) // 2
+    paste_y = (target_size - scaled_size[1]) // 2
+    background.paste(scaled, (paste_x, paste_y), scaled)
+
+    # Convert to bytes
+    import io
+    buffer = io.BytesIO()
+    background.save(buffer, format="PNG")
+    return buffer.getvalue(), scale
+
+
 def generate_image(full_prompt: str, output_path: Path, reference_image: Optional[Path] = None) -> Path:
-    """Generate image with Gemini, optionally using a reference image."""
+    """
+    Generate image with Gemini, optionally using a reference image.
+
+    Args:
+        full_prompt: The generation prompt
+        output_path: Where to save the generated image
+        reference_image: Path to a reference image file to send to Gemini
+    """
     from google import genai
     from google.genai import types
 
@@ -146,9 +228,12 @@ def generate_image(full_prompt: str, output_path: Path, reference_image: Optiona
     response = client.models.generate_content(
         model="gemini-3-pro-image-preview",
         contents=contents,
-        config={
-            "response_modalities": ["image", "text"],
-        },
+        config=types.GenerateContentConfig(
+            response_modalities=["image", "text"],
+            image_config=types.ImageConfig(
+                aspect_ratio="1:1",
+            ),
+        ),
     )
 
     # Extract image from response
@@ -163,43 +248,61 @@ def generate_image(full_prompt: str, output_path: Path, reference_image: Optiona
     raise RuntimeError("No image generated in response")
 
 
-def build_base_prompt(character_prompt: str, requested_resolution: Optional[Tuple[int, int]] = None) -> str:
+def build_base_prompt(character_prompt: str, requested_resolution: Optional[Tuple[int, int]] = None,
+                      extra_instructions: Optional[str] = None) -> str:
     """Build prompt for base idle sprite."""
     resolution_hint = ""
     if requested_resolution:
         resolution_hint = f"\nThe character should be {requested_resolution[0]}x{requested_resolution[1]} pixels in size."
-    return f"""Create pixel art of {character_prompt}, side-on view, facing right.{resolution_hint}
+    extra = f"\n{extra_instructions}" if extra_instructions else ""
+    return f"""Create pixel art of {character_prompt}, side-on view, facing right.{resolution_hint}{extra}
 {STYLE_PROMPT}"""
 
 
-def build_frame_prompt(character_prompt: str, frame_prompt: str, requested_resolution: Optional[Tuple[int, int]] = None) -> str:
+def build_frame_prompt(character_prompt: str, frame_prompt: str, requested_resolution: Optional[Tuple[int, int]] = None,
+                       extra_instructions: Optional[str] = None) -> str:
     """Build prompt for an animation frame with reference image."""
     resolution_hint = ""
     if requested_resolution:
         resolution_hint = f"\nThe character should be {requested_resolution[0]}x{requested_resolution[1]} pixels in size."
+    extra = f"\n{extra_instructions}" if extra_instructions else ""
     return f"""The attached image shows the base sprite for {character_prompt}.
 Create a new frame of this EXACT same character showing: {frame_prompt}
 The character must look identical - same colors, same proportions, same style.
-Only the pose/action should change.{resolution_hint}
-{STYLE_PROMPT}"""
+Only the pose/action should change.{resolution_hint}{extra}
+{FRAME_STYLE_PROMPT}"""
 
 
 # =============================================================================
 # PIXELGRID EXTRACTION
 # =============================================================================
 
-def extract_sprite(raw_path: Path, output_path: Path) -> Tuple[int, int]:
+def extract_sprite(raw_path: Path, output_path: Path,
+                   hint_cell_size: Optional[Tuple[int, int]] = None,
+                   target_frame_size: Optional[Tuple[int, int]] = None) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int, int, int]]:
     """
     Extract pixels using pixelgrid.
 
-    Returns (width, height) of extracted sprite.
+    Args:
+        raw_path: Path to raw Gemini output
+        output_path: Path to save extracted sprite
+        hint_cell_size: Optional (width, height) to use instead of auto-detection
+        target_frame_size: If provided, extract this size from grid center (preserves Gemini's positioning)
+
+    Returns:
+        ((sprite_width, sprite_height), (cell_width, cell_height), (left, top, right, bottom))
+        where the third tuple is content bounds relative to grid center
     """
     img = Image.open(raw_path)
     print(f"Raw image size: {img.size}")
 
-    # Detect grid
-    cell_width, cell_height = detect_grid_size(img)
-    print(f"Detected cell size: {cell_width}x{cell_height}")
+    # Detect grid (or use hint)
+    if hint_cell_size:
+        cell_width, cell_height = hint_cell_size
+        print(f"Using cell size hint: {cell_width}x{cell_height}")
+    else:
+        cell_width, cell_height = detect_grid_size(img)
+        print(f"Detected cell size: {cell_width}x{cell_height}")
 
     # Find best offset
     offset_x, offset_y = find_best_offset(img, cell_width, cell_height)
@@ -207,18 +310,52 @@ def extract_sprite(raw_path: Path, output_path: Path) -> Tuple[int, int]:
 
     # Refine grid lines
     x_lines, y_lines = refine_grid_lines(img, cell_width, cell_height, offset_x, offset_y)
-    print(f"Grid: {len(x_lines)-1} x {len(y_lines)-1} cells")
+    grid_width = len(x_lines) - 1
+    grid_height = len(y_lines) - 1
+    print(f"Grid: {grid_width} x {grid_height} cells")
 
     # Extract pixels
     pixel_img, bbox = extract_pixels(img, x_lines, y_lines, remove_green=True)
     print(f"Content bbox: x={bbox[0]}, y={bbox[1]}, w={bbox[2]}, h={bbox[3]}")
 
-    # Crop to content
-    cropped = crop_to_content(pixel_img, bbox)
-    cropped.save(output_path)
-    print(f"Saved extracted sprite: {output_path} ({cropped.size[0]}x{cropped.size[1]})")
+    # Get content bounds relative to grid center
+    center_x = grid_width // 2
+    center_y = grid_height // 2
+    content_left, content_top, content_w, content_h = bbox
 
-    return cropped.size
+    # Content bounds relative to grid center
+    rel_content = (
+        content_left - center_x,  # left relative to center
+        content_top - center_y,   # top relative to center
+        content_left + content_w - center_x,  # right relative to center
+        content_top + content_h - center_y,   # bottom relative to center
+    )
+
+    if target_frame_size:
+        # Extract region of target_frame_size centered on grid
+        target_w, target_h = target_frame_size
+        left = center_x - target_w // 2
+        top = center_y - target_h // 2
+        right = left + target_w
+        bottom = top + target_h
+
+        # Clamp to grid bounds
+        left = max(0, left)
+        top = max(0, top)
+        right = min(grid_width, right)
+        bottom = min(grid_height, bottom)
+
+        result = pixel_img.crop((left, top, right, bottom))
+        print(f"Extracted region: ({left}, {top}) to ({right}, {bottom})")
+        result.save(output_path)
+        print(f"Saved extracted sprite: {output_path} ({result.size[0]}x{result.size[1]})")
+        return result.size, (cell_width, cell_height), rel_content
+    else:
+        # For init - crop to content
+        cropped = crop_to_content(pixel_img, bbox)
+        cropped.save(output_path)
+        print(f"Saved extracted sprite: {output_path} ({cropped.size[0]}x{cropped.size[1]})")
+        return cropped.size, (cell_width, cell_height), rel_content
 
 
 # =============================================================================
@@ -247,6 +384,8 @@ def init_metadata(
     cell_size: Tuple[int, int],
     frame_size: Tuple[int, int],
     requested_resolution: Optional[Tuple[int, int]] = None,
+    style_instructions: Optional[str] = None,
+    detected_cell_size: Optional[Tuple[int, int]] = None,
 ) -> dict:
     """Create initial metadata structure."""
     metadata = {
@@ -262,6 +401,10 @@ def init_metadata(
     }
     if requested_resolution:
         metadata["requested_resolution"] = list(requested_resolution)
+    if style_instructions:
+        metadata["style_instructions"] = style_instructions
+    if detected_cell_size:
+        metadata["detected_cell_size"] = list(detected_cell_size)
     return metadata
 
 
@@ -282,6 +425,7 @@ def cmd_init(args) -> int:
     project_dir: Path = args.project_dir
     character_prompt: str = args.character_prompt
     cell_size: Tuple[int, int] = parse_size_arg(args.cell_size)
+    style_instructions: Optional[str] = args.style
     if args.resolution:
         requested_resolution: Tuple[int, int] = parse_size_arg(args.resolution)
     else:
@@ -292,6 +436,8 @@ def cmd_init(args) -> int:
     print(f"Character: {character_prompt}")
     print(f"Cell size: {cell_size[0]}x{cell_size[1]}")
     print(f"Requested resolution: {requested_resolution[0]}x{requested_resolution[1]}")
+    if style_instructions:
+        print(f"Style: {style_instructions}")
 
     # Create directory structure
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -309,16 +455,20 @@ def cmd_init(args) -> int:
 
     # Generate base sprite
     raw_path = project_dir / "raw" / "idle_base.png"
-    prompt = build_base_prompt(character_prompt, requested_resolution)
+    prompt = build_base_prompt(character_prompt, requested_resolution, style_instructions)
     generate_image(prompt, raw_path)
 
     # Extract pixels
     frames_path = project_dir / "frames" / "idle_0.png"
-    extracted_size = extract_sprite(raw_path, frames_path)
+    extracted_size, detected_cell_size, rel_content = extract_sprite(raw_path, frames_path)
 
-    # Round frame size to cell multiple
-    frame_size = round_to_cell_multiple(extracted_size, cell_size)
-    print(f"Extracted size: {extracted_size[0]}x{extracted_size[1]} -> padded to: {frame_size[0]}x{frame_size[1]}")
+    # Content bounds relative to grid center: (left, top, right, bottom)
+    # Frame size needs to fit content on both sides of center
+    content_extent_w = max(abs(rel_content[0]), abs(rel_content[2])) * 2
+    content_extent_h = max(abs(rel_content[1]), abs(rel_content[3])) * 2
+    frame_size = round_to_cell_multiple((content_extent_w, content_extent_h), cell_size)
+    print(f"Content bounds: {rel_content}")
+    print(f"Frame size: {frame_size[0]}x{frame_size[1]}")
 
     # Pad the extracted frame to the target frame size
     if extracted_size != frame_size:
@@ -327,7 +477,10 @@ def cmd_init(args) -> int:
         padded.save(frames_path)
 
     # Initialize metadata
-    metadata = init_metadata(character_prompt, cell_size, frame_size, requested_resolution)
+    metadata = init_metadata(character_prompt, cell_size, frame_size, requested_resolution, style_instructions, detected_cell_size)
+    # Store content bounds (relative to grid center) for union tracking
+    # Convert to Python ints to ensure JSON serialization works
+    metadata["content_bounds"] = [int(x) for x in rel_content]  # [left, top, right, bottom]
     metadata["animations"]["idle"]["frames"].append({
         "prompt": None,
         "raw": "idle_base.png",
@@ -343,7 +496,7 @@ def cmd_init(args) -> int:
         num_colors = args.colors
         if num_colors is None:
             print("\nDetecting optimal color count...")
-            num_colors = detect_optimal_colors(base_img)
+            num_colors = detect_optimal_colors(base_img, sensitivity=args.sensitivity)
             print(f"Detected optimal colors: {num_colors}")
 
         print(f"\nExtracting palette ({num_colors} colors)...")
@@ -359,6 +512,17 @@ def cmd_init(args) -> int:
 
         # Store palette in metadata
         metadata["palette"] = palette_to_json(palette)
+
+    # Create reference image from idle_0 for consistent positioning during re-extraction
+    reference_data, reference_scale = prepare_reference_image(frames_path)
+    reference_path = project_dir / "raw" / "idle_base_reference.png"
+    with open(reference_path, "wb") as f:
+        f.write(reference_data)
+    print(f"Saved reference image: {reference_path} (scale: {reference_scale}x)")
+    metadata["reference_scale"] = reference_scale
+
+    # Update metadata to use reference image as "raw" for idle_0
+    metadata["animations"]["idle"]["frames"][0]["raw"] = "idle_base_reference.png"
 
     save_metadata(project_dir, metadata)
 
@@ -387,6 +551,7 @@ def cmd_add_frame(args) -> int:
     requested_resolution = None
     if "requested_resolution" in metadata:
         requested_resolution = tuple(metadata["requested_resolution"])
+    style_instructions = metadata.get("style_instructions")
 
     # Get or create animation
     if animation not in metadata["animations"]:
@@ -398,30 +563,52 @@ def cmd_add_frame(args) -> int:
     anim_data = metadata["animations"][animation]
     frame_num = len(anim_data["frames"])
 
-    # Generate image using base sprite as reference
+    # Generate image using the stored reference image
     raw_filename = f"{animation}_frame_{frame_num}.png"
     raw_path = project_dir / "raw" / raw_filename
-    base_sprite = project_dir / "raw" / "idle_base.png"
+    reference_image = project_dir / "raw" / "idle_base_reference.png"
 
-    prompt = build_frame_prompt(character_prompt, frame_prompt, requested_resolution)
-    generate_image(prompt, raw_path, reference_image=base_sprite)
+    prompt = build_frame_prompt(character_prompt, frame_prompt, requested_resolution, style_instructions)
+    generate_image(prompt, raw_path, reference_image=reference_image)
 
-    # Extract pixels
+    # Get the scale from metadata for cell size hint
+    reference_scale = metadata["reference_scale"]
+    hint_cell_size = (reference_scale, reference_scale)
+
+    # Extract pixels with current frame size
     extracted_filename = f"{animation}_{frame_num}.png"
     extracted_path = project_dir / "frames" / extracted_filename
-    extracted_size = extract_sprite(raw_path, extracted_path)
+    extracted_size, _, rel_content = extract_sprite(raw_path, extracted_path,
+                                                    hint_cell_size=hint_cell_size,
+                                                    target_frame_size=current_frame_size)
 
-    # Calculate required frame size (max of current and extracted, rounded to cell multiple)
-    required_size = (
-        max(current_frame_size[0], extracted_size[0]),
-        max(current_frame_size[1], extracted_size[1]),
-    )
-    new_frame_size = round_to_cell_multiple(required_size, cell_size)
+    # Check if new content extends beyond current bounds
+    current_bounds = metadata.get("content_bounds", [0, 0, 0, 0])
+    new_bounds = [
+        int(min(current_bounds[0], rel_content[0])),  # left
+        int(min(current_bounds[1], rel_content[1])),  # top
+        int(max(current_bounds[2], rel_content[2])),  # right
+        int(max(current_bounds[3], rel_content[3])),  # bottom
+    ]
 
-    # Check if we need to expand all frames
-    if new_frame_size != current_frame_size:
-        print(f"New frame exceeds current size, expanding all frames...")
-        expand_all_frames(project_dir, metadata, new_frame_size)
+    if new_bounds != current_bounds:
+        # Content bounds expanded - calculate new frame size
+        content_extent_w = max(abs(new_bounds[0]), abs(new_bounds[2])) * 2
+        content_extent_h = max(abs(new_bounds[1]), abs(new_bounds[3])) * 2
+        new_frame_size = round_to_cell_multiple((content_extent_w, content_extent_h), cell_size)
+
+        if new_frame_size != current_frame_size:
+            print(f"Content bounds expanded, re-extracting all frames...")
+            print(f"  Old bounds: {current_bounds}")
+            print(f"  New bounds: {new_bounds}")
+            metadata["content_bounds"] = new_bounds
+            expand_all_frames(project_dir, metadata, new_frame_size)
+            # Re-extract this frame with new size
+            extracted_size, _, _ = extract_sprite(raw_path, extracted_path,
+                                                  hint_cell_size=hint_cell_size,
+                                                  target_frame_size=new_frame_size)
+        else:
+            metadata["content_bounds"] = new_bounds
 
     # Pad the new frame to the target frame size
     frame_size = tuple(metadata["frame_size"])
@@ -638,6 +825,10 @@ def main():
                         help="Skip automatic palette extraction and quantization")
     p_init.add_argument("--colors", type=int, default=None,
                         help="Number of palette colors (default: auto-detect)")
+    p_init.add_argument("--sensitivity", "-s", type=float, default=DEFAULT_SENSITIVITY,
+                        help=f"Sensitivity for color auto-detection (default: {DEFAULT_SENSITIVITY})")
+    p_init.add_argument("--style", type=str, default=None,
+                        help="Extra style instructions for generation (e.g., 'Few colors and simple shapes')")
 
     # add-frame
     p_add = subparsers.add_parser("add-frame", help="Add a frame to an animation")
