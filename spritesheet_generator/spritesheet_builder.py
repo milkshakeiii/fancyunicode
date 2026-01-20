@@ -6,14 +6,17 @@ Builds spritesheets using Gemini image generation and pixelgrid.py extraction.
 Supports additive building across multiple calls.
 
 Usage:
-    python3 spritesheet_builder.py init <project_dir> <character_prompt> [--cell-size WxH] [--resolution WxH]
-    python3 spritesheet_builder.py add-frame <project_dir> <animation> <frame_prompt>
+    python3 spritesheet_builder.py init <project_dir> <character_prompt> [--cell-size WxH] [--resolution WxH] [--no-quantize]
+    python3 spritesheet_builder.py add-frame <project_dir> <animation> <frame_prompt> [--no-quantize]
     python3 spritesheet_builder.py build <project_dir>
     python3 spritesheet_builder.py show <project_dir>
+    python3 spritesheet_builder.py quantize <project_dir> [--colors N]
 
 Options:
     --cell-size WxH    Frame dimensions will be multiples of this (default: 10x20)
     --resolution WxH   Hint for Gemini about desired sprite size (default: 2 cells wide x 1 cell tall)
+    --no-quantize      Skip automatic palette quantization (init/add-frame)
+    --colors N         Number of colors for palette (default: auto-detect)
 
 Requires GOOGLE_API_KEY environment variable to be set.
 """
@@ -35,6 +38,18 @@ from pixelgrid import (
     refine_grid_lines,
     extract_pixels,
     crop_to_content,
+)
+
+from palette import (
+    extract_palette,
+    quantize_to_palette,
+    unify_project_palette,
+    get_project_palette,
+    set_project_palette,
+    palette_to_json,
+    palette_from_json,
+    color_to_hex,
+    detect_optimal_colors,
 )
 
 
@@ -324,12 +339,40 @@ def cmd_init(args) -> int:
         "extracted": "idle_0.png"
     })
 
+    # Auto-quantize by default unless --no-quantize is specified
+    palette = None
+    if not args.no_quantize:
+        base_img = Image.open(frames_path)
+
+        # Auto-detect optimal colors if not specified
+        num_colors = args.colors
+        if num_colors is None:
+            print("\nDetecting optimal color count...")
+            num_colors = detect_optimal_colors(base_img)
+            print(f"Detected optimal colors: {num_colors}")
+
+        print(f"\nExtracting palette ({num_colors} colors)...")
+        palette = extract_palette(base_img, num_colors)
+        print(f"Palette extracted:")
+        for i, color in enumerate(palette):
+            print(f"  {i+1}. {color_to_hex(color)}")
+
+        # Quantize the base sprite to clean palette
+        quantized = quantize_to_palette(base_img, palette)
+        quantized.save(frames_path)
+        print(f"Base sprite quantized to {len(palette)} colors")
+
+        # Store palette in metadata
+        metadata["palette"] = palette_to_json(palette)
+
     save_metadata(project_dir, metadata)
 
     print(f"\nProject initialized!")
     print(f"  Cell size: {cell_size[0]}x{cell_size[1]}")
     print(f"  Frame size: {frame_size[0]}x{frame_size[1]}")
     print(f"  Base sprite: {frames_path}")
+    if palette:
+        print(f"  Palette: {len(palette)} colors (stored in metadata)")
     return 0
 
 
@@ -397,6 +440,19 @@ def cmd_add_frame(args) -> int:
         padded = pad_frame_to_size(frame_img, frame_size)
         padded.save(extracted_path)
         print(f"Padded new frame to {frame_size[0]}x{frame_size[1]}")
+        frame_img = padded
+
+    # Auto-quantize by default unless --no-quantize is specified
+    if not args.no_quantize:
+        palette = get_project_palette(project_dir)
+        if palette:
+            print(f"Quantizing to project palette ({len(palette)} colors)...")
+            quantized = quantize_to_palette(frame_img, palette)
+            quantized.save(extracted_path)
+            print(f"Frame quantized to palette")
+        else:
+            print("Note: No palette in metadata, skipping quantization")
+            print("Run 'quantize' command to unify all frames to a shared palette")
 
     # Update metadata
     anim_data["frames"].append({
@@ -511,6 +567,13 @@ def cmd_show(args) -> int:
     if "requested_resolution" in metadata:
         print(f"Requested resolution: {metadata['requested_resolution'][0]}x{metadata['requested_resolution'][1]}")
     print(f"Frame size: {metadata['frame_size'][0]}x{metadata['frame_size'][1]}")
+
+    # Show palette if defined
+    if "palette" in metadata:
+        palette = palette_from_json(metadata["palette"])
+        print(f"Palette: {len(palette)} colors")
+        for i, color in enumerate(palette):
+            print(f"  {i+1}. {color_to_hex(color)} - RGB({color[0]}, {color[1]}, {color[2]})")
     print()
 
     print("Animations:")
@@ -545,6 +608,27 @@ def cmd_show(args) -> int:
     return 0
 
 
+def cmd_quantize(args) -> int:
+    """Quantize all frames to a shared palette."""
+    project_dir: Path = args.project_dir
+    max_colors = args.colors  # None means auto-detect
+
+    print(f"Quantizing project: {project_dir}")
+    if max_colors is not None:
+        print(f"Colors: {max_colors}")
+    else:
+        print(f"Colors: auto-detect")
+    print()
+
+    try:
+        palette = unify_project_palette(project_dir, max_colors)
+        print(f"\nProject quantized to {len(palette)} colors!")
+        return 0
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -563,12 +647,18 @@ def main():
                         help="Cell size as WxH (default: 10x20). Frame dimensions will be multiples of this.")
     p_init.add_argument("--resolution", default=None,
                         help="Requested resolution as WxH. Hint for Gemini (default: 2 cells wide x 1 cell tall).")
+    p_init.add_argument("--no-quantize", action="store_true",
+                        help="Skip automatic palette extraction and quantization")
+    p_init.add_argument("--colors", type=int, default=None,
+                        help="Number of palette colors (default: auto-detect)")
 
     # add-frame
     p_add = subparsers.add_parser("add-frame", help="Add a frame to an animation")
     p_add.add_argument("project_dir", type=Path, help="Project directory")
     p_add.add_argument("animation", help="Animation name (e.g., 'idle', 'walk')")
     p_add.add_argument("frame_prompt", help="Description of what this frame shows")
+    p_add.add_argument("--no-quantize", action="store_true",
+                       help="Skip automatic quantization to project palette")
 
     # build
     p_build = subparsers.add_parser("build", help="Build the spritesheet")
@@ -577,6 +667,12 @@ def main():
     # show
     p_show = subparsers.add_parser("show", help="Show project status")
     p_show.add_argument("project_dir", type=Path, help="Project directory")
+
+    # quantize
+    p_quantize = subparsers.add_parser("quantize", help="Quantize all frames to shared palette")
+    p_quantize.add_argument("project_dir", type=Path, help="Project directory")
+    p_quantize.add_argument("--colors", "-c", type=int, default=None,
+                            help="Number of palette colors (default: auto-detect)")
 
     args = parser.parse_args()
 
@@ -598,6 +694,8 @@ def main():
         sys.exit(cmd_build(args))
     elif args.command == "show":
         sys.exit(cmd_show(args))
+    elif args.command == "quantize":
+        sys.exit(cmd_quantize(args))
 
 
 if __name__ == "__main__":
