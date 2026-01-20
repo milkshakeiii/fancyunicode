@@ -50,6 +50,7 @@ from palette import (
     palette_from_json,
     color_to_hex,
     detect_optimal_colors,
+    DEFAULT_SENSITIVITY,
 )
 
 
@@ -60,12 +61,6 @@ from palette import (
 STYLE_PROMPT = """The image should be on a solid bright green (#00FF00) background for easy chroma keying.
 The character should be centered, showing their full side profile.
 CRITICAL: The ENTIRE character must fit within the image with large margins. Every body part - head, ears, tail, legs, arms, wings - must be fully visible with space around them. Nothing can touch or go past any edge. Make the character small enough to leave 20% empty green space on all sides.
-Use flat solid colors with no gradients, shading, or anti-aliasing.
-NO outlines. Extremely simple shapes only.
-Eyes should be medium-sized solid BLACK circles, no whites, no eyelids, no pupils.
-No facial details other than eyes. No two details should be close to one another.
-All features must be thick and blocky. No thin lines - items, clothing, limbs should be as wide as the character's head.
-Large solid color regions, minimal color count.
 No shadows on the green background.
 The green background should be completely uniform #00FF00.
 The entire image should be filled with the green background, edge to edge, no white or other colors."""
@@ -396,13 +391,8 @@ def cmd_add_frame(args) -> int:
     # Get or create animation
     if animation not in metadata["animations"]:
         print(f"Creating new animation: {animation}")
-        # New animations start with idle base as frame 0 (shared)
         metadata["animations"][animation] = {
-            "frames": [{
-                "prompt": None,
-                "raw": None,
-                "extracted": "idle_0.png"  # Shared base
-            }]
+            "frames": []
         }
 
     anim_data = metadata["animations"][animation]
@@ -411,7 +401,7 @@ def cmd_add_frame(args) -> int:
     # Generate image using base sprite as reference
     raw_filename = f"{animation}_frame_{frame_num}.png"
     raw_path = project_dir / "raw" / raw_filename
-    base_sprite = project_dir / "frames" / "idle_0.png"
+    base_sprite = project_dir / "raw" / "idle_base.png"
 
     prompt = build_frame_prompt(character_prompt, frame_prompt, requested_resolution)
     generate_image(prompt, raw_path, reference_image=base_sprite)
@@ -504,20 +494,16 @@ def cmd_build(args) -> int:
         frames = anim_data["frames"]
         print(f"  {anim_name}: {len(frames)} frames")
 
-        last_frame = None
         for col in range(max_frames):
+            frame_img = None
             if col < len(frames):
                 frame_info = frames[col]
                 frame_path = frames_dir / frame_info["extracted"]
                 if frame_path.exists():
                     frame_img = Image.open(frame_path).convert("RGBA")
-                    last_frame = frame_img
                 else:
                     print(f"    Warning: Missing {frame_path}")
-                    frame_img = last_frame
-            else:
-                # Pad with last frame
-                frame_img = last_frame
+            # Leave blank for missing frames (don't pad)
 
             if frame_img:
                 x = col * frame_size[0]
@@ -612,16 +598,17 @@ def cmd_quantize(args) -> int:
     """Quantize all frames to a shared palette."""
     project_dir: Path = args.project_dir
     max_colors = args.colors  # None means auto-detect
+    sensitivity = getattr(args, 'sensitivity', DEFAULT_SENSITIVITY)
 
     print(f"Quantizing project: {project_dir}")
     if max_colors is not None:
         print(f"Colors: {max_colors}")
     else:
-        print(f"Colors: auto-detect")
+        print(f"Colors: auto-detect (sensitivity: {sensitivity})")
     print()
 
     try:
-        palette = unify_project_palette(project_dir, max_colors)
+        palette = unify_project_palette(project_dir, max_colors, sensitivity=sensitivity)
         print(f"\nProject quantized to {len(palette)} colors!")
         return 0
     except Exception as e:
@@ -673,6 +660,8 @@ def main():
     p_quantize.add_argument("project_dir", type=Path, help="Project directory")
     p_quantize.add_argument("--colors", "-c", type=int, default=None,
                             help="Number of palette colors (default: auto-detect)")
+    p_quantize.add_argument("--sensitivity", "-s", type=float, default=DEFAULT_SENSITIVITY,
+                            help=f"Sensitivity for auto-detection (higher = more colors, default: {DEFAULT_SENSITIVITY})")
 
     args = parser.parse_args()
 

@@ -3,7 +3,8 @@
 Demo script to display spritesheets using pyunicodegame.
 
 Usage:
-    python demo_spritesheet.py spritesheet.png
+    python demo_spritesheet.py output/warrior          # project directory
+    python demo_spritesheet.py spritesheet.png         # direct spritesheet file
 
 Spritesheet format:
     - Multiple rows, each row is a different animation
@@ -34,10 +35,10 @@ from PIL import Image
 def main():
     parser = argparse.ArgumentParser(description="Demo spritesheet animation")
     parser.add_argument(
-        "spritesheet",
+        "path",
         nargs="?",
         default="output/spritesheet.png",
-        help="Path to spritesheet PNG (default: output/spritesheet.png)",
+        help="Path to project directory or spritesheet PNG",
     )
     parser.add_argument(
         "--frame-width",
@@ -65,7 +66,17 @@ def main():
     )
     args = parser.parse_args()
 
-    spritesheet_path = Path(args.spritesheet)
+    # Handle both project directory and direct spritesheet path
+    input_path = Path(args.path)
+    if input_path.is_dir():
+        # Project directory - look for spritesheet.png
+        spritesheet_path = input_path / "spritesheet.png"
+        metadata_path = input_path / "metadata.json"
+    else:
+        # Direct spritesheet file
+        spritesheet_path = input_path
+        metadata_path = spritesheet_path.parent / "metadata.json"
+
     if not spritesheet_path.exists():
         print(f"Error: Spritesheet not found: {spritesheet_path}")
         sys.exit(1)
@@ -75,13 +86,14 @@ def main():
     sheet_width, sheet_height = img.size
 
     # Determine frame dimensions and animation names from metadata
-    metadata_path = spritesheet_path.parent / "metadata.json"
     metadata = {}
     if metadata_path.exists():
         with open(metadata_path) as f:
             metadata = json.load(f)
-        frame_width = args.frame_width or metadata.get("frame_width", 20)
-        frame_height = args.frame_height or metadata.get("frame_height", 20)
+        # frame_size is stored as [width, height]
+        frame_size = metadata.get("frame_size", [20, 20])
+        frame_width = args.frame_width or frame_size[0]
+        frame_height = args.frame_height or frame_size[1]
     else:
         frame_width = args.frame_width or 20
         frame_height = args.frame_height or 20
@@ -101,7 +113,7 @@ def main():
         while len(anim_names) < rows:
             anim_names.append(f"row{len(anim_names)}")
     elif "animations" in metadata:
-        anim_names = metadata["animations"]
+        anim_names = list(metadata["animations"].keys())
         while len(anim_names) < rows:
             anim_names.append(f"row{len(anim_names)}")
     else:

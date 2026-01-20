@@ -36,6 +36,9 @@ except ImportError:
 # Type alias for RGBA color tuples
 Color = Tuple[int, int, int, int]
 
+# Default sensitivity for auto-detecting optimal color count
+DEFAULT_SENSITIVITY = 2.5
+
 
 # =============================================================================
 # CORE PALETTE FUNCTIONS
@@ -144,7 +147,8 @@ def extract_palette(img: Image.Image, max_colors: int = 8) -> List[Color]:
     return palette
 
 
-def detect_optimal_colors(img: Image.Image, min_k: int = 2, max_k: int = 16) -> int:
+def detect_optimal_colors(img: Image.Image, min_k: int = 4, max_k: int = 16,
+                          sensitivity: float = DEFAULT_SENSITIVITY) -> int:
     """
     Detect the optimal number of colors for an image using the elbow method.
 
@@ -153,8 +157,9 @@ def detect_optimal_colors(img: Image.Image, min_k: int = 2, max_k: int = 16) -> 
 
     Args:
         img: PIL Image to analyze
-        min_k: Minimum number of colors to consider (default: 2)
+        min_k: Minimum number of colors to consider (default: 4)
         max_k: Maximum number of colors to consider (default: 16)
+        sensitivity: Higher values bias toward more colors (default: 1.0)
 
     Returns:
         Optimal number of colors (k)
@@ -226,6 +231,13 @@ def detect_optimal_colors(img: Image.Image, min_k: int = 2, max_k: int = 16) -> 
     # The elbow is the point with maximum distance from the line
     elbow_idx = np.argmax(distances)
     optimal_k = k_values[elbow_idx]
+
+    # Apply sensitivity bias toward more colors
+    # sensitivity > 1 shifts toward more colors
+    if sensitivity > 1.0:
+        # Add extra colors based on sensitivity
+        bonus = int((sensitivity - 1.0) * (max_k - optimal_k) * 0.5)
+        optimal_k = min(optimal_k + bonus, max_k)
 
     return optimal_k
 
@@ -441,13 +453,15 @@ def get_all_frame_paths(project_dir: Path) -> List[Path]:
     return paths
 
 
-def unify_project_palette(project_dir: Path, max_colors: Optional[int] = None) -> List[Color]:
+def unify_project_palette(project_dir: Path, max_colors: Optional[int] = None,
+                          sensitivity: float = DEFAULT_SENSITIVITY) -> List[Color]:
     """
     Extract palette from base sprite and quantize all frames to it.
 
     Args:
         project_dir: Path to project directory
         max_colors: Maximum palette colors (None = auto-detect)
+        sensitivity: Higher values bias toward more colors when auto-detecting (default: 3.0)
 
     Returns:
         The unified palette
@@ -463,7 +477,7 @@ def unify_project_palette(project_dir: Path, max_colors: Optional[int] = None) -
     # Auto-detect optimal color count if not specified
     if max_colors is None:
         print(f"Detecting optimal color count from {base_sprite_path}...")
-        max_colors = detect_optimal_colors(base_img)
+        max_colors = detect_optimal_colors(base_img, sensitivity=sensitivity)
         print(f"Detected optimal colors: {max_colors}")
 
     # Extract palette from base sprite
@@ -608,13 +622,14 @@ def cmd_unify(args) -> int:
     """Unify all frames in a project to a shared palette."""
     project_dir = Path(args.project_dir)
     max_colors = args.colors
+    sensitivity = getattr(args, 'sensitivity', DEFAULT_SENSITIVITY)
 
     if not project_dir.exists():
         print(f"Error: Project directory not found: {project_dir}")
         return 1
 
     try:
-        unify_project_palette(project_dir, max_colors)
+        unify_project_palette(project_dir, max_colors, sensitivity=sensitivity)
         print("\nPalette unified successfully!")
         return 0
     except Exception as e:
@@ -719,6 +734,8 @@ def main():
     p_unify.add_argument("project_dir", type=Path, help="Project directory")
     p_unify.add_argument("--colors", "-c", type=int, default=None,
                          help="Number of colors (default: auto-detect)")
+    p_unify.add_argument("--sensitivity", "-s", type=float, default=DEFAULT_SENSITIVITY,
+                         help=f"Sensitivity for auto-detection (higher = more colors, default: {DEFAULT_SENSITIVITY})")
 
     # set-palette
     p_set = subparsers.add_parser("set-palette", help="Set palette for a project")
