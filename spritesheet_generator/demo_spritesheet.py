@@ -13,7 +13,9 @@ Spritesheet format:
 
 Controls:
     Up/Down arrows: Cycle through animations (rows)
+    Left/Right arrows: Step through frames (cancels autoplay)
     L or Space: Toggle loop/one-shot mode
+    P: Resume autoplay
     Q or ESC: Quit
 """
 
@@ -106,21 +108,30 @@ def main():
     print(f"Frame size: {frame_width}x{frame_height}")
     print(f"Grid: {cols} columns x {rows} rows")
 
-    # Animation names (prefer: CLI arg > metadata > defaults)
+    # Animation names and frame counts (prefer: CLI arg > metadata > defaults)
+    anim_frame_counts = []  # Number of frames per animation
     if args.names:
         anim_names = args.names.split(",")
         # Pad with default names if needed
         while len(anim_names) < rows:
             anim_names.append(f"row{len(anim_names)}")
+        anim_frame_counts = [cols] * rows  # Default to full row
     elif "animations" in metadata:
         anim_names = list(metadata["animations"].keys())
+        for name in anim_names:
+            anim_data = metadata["animations"].get(name, {})
+            frame_count = len(anim_data.get("frames", []))
+            anim_frame_counts.append(frame_count if frame_count > 0 else cols)
         while len(anim_names) < rows:
             anim_names.append(f"row{len(anim_names)}")
+            anim_frame_counts.append(cols)
     else:
         anim_names = ["idle"] + [f"row{i}" for i in range(1, rows)]
+        anim_frame_counts = [cols] * rows
 
     anim_names = anim_names[:rows]  # Trim if too many
-    print(f"Animations: {', '.join(anim_names)}")
+    anim_frame_counts = anim_frame_counts[:rows]
+    print(f"Animations: {', '.join(f'{n}({c})' for n, c in zip(anim_names, anim_frame_counts))}")
 
     # Use 10x20 font so 20x20 sprites are 2x1 cells
     cell_width = 10
@@ -133,6 +144,7 @@ def main():
     # State
     current_row = 0
     is_looping = True
+    is_autoplay = True  # False when manually stepping with arrow keys
 
     # Initialize pyunicodegame with 10x20 font
     pyunicodegame.init(
@@ -162,9 +174,10 @@ def main():
 
     sprites = []
     for row in range(rows):
-        # Frame indices for this row
+        # Frame indices for this row (only actual frames, not full row)
+        num_frames = anim_frame_counts[row]
         start_frame = row * cols
-        frame_indices = list(range(start_frame, start_frame + cols))
+        frame_indices = list(range(start_frame, start_frame + num_frames))
 
         sprite = pyunicodegame.create_pixel_sprite(
             sheet,
@@ -176,13 +189,13 @@ def main():
         # Create loop and one-shot animations
         loop_anim = pyunicodegame.create_animation(
             "loop",
-            frame_indices=list(range(cols)),  # Local indices within sprite's frames
+            frame_indices=list(range(num_frames)),  # Local indices within sprite's frames
             frame_duration=1.0 / args.fps,
             loop=True,
         )
         oneshot_anim = pyunicodegame.create_animation(
             "oneshot",
-            frame_indices=list(range(cols)),
+            frame_indices=list(range(num_frames)),
             frame_duration=1.0 / args.fps,
             loop=False,
         )
@@ -207,9 +220,12 @@ def main():
         current_row = new_row
         root.add_sprite(sprites[current_row])
 
-        # Play appropriate animation
-        anim_name = "loop" if is_looping else "oneshot"
-        sprites[current_row].play_animation(anim_name)
+        # Play appropriate animation (or stay paused if in manual mode)
+        if is_autoplay:
+            anim_name = "loop" if is_looping else "oneshot"
+            sprites[current_row].play_animation(anim_name)
+        else:
+            sprites[current_row].current_frame = 0
 
     def toggle_loop():
         nonlocal is_looping
@@ -222,12 +238,31 @@ def main():
 
     def render():
         sprite = sprites[current_row]
+        num_frames = anim_frame_counts[current_row]
 
         # Animation name and frame info
-        mode = "LOOP" if is_looping else "ONCE"
+        if is_autoplay:
+            mode = "LOOP" if is_looping else "ONCE"
+        else:
+            mode = "MANUAL"
         name = anim_names[current_row]
         root.put(1, 0, f"{name} ({current_row + 1}/{rows})", (200, 200, 200))
-        root.put(1, 1, f"Frame {sprite.current_frame + 1}/{cols} [{mode}]", (150, 150, 150))
+        root.put(1, 1, f"Frame {sprite.current_frame + 1}/{num_frames} [{mode}]", (150, 150, 150))
+
+    def step_frame(delta):
+        nonlocal is_autoplay
+        is_autoplay = False
+        sprite = sprites[current_row]
+        sprite.stop_animation()
+        num_frames = anim_frame_counts[current_row]
+        new_frame = (sprite.current_frame + delta) % num_frames
+        sprite.current_frame = new_frame
+
+    def resume_autoplay():
+        nonlocal is_autoplay
+        is_autoplay = True
+        anim_name = "loop" if is_looping else "oneshot"
+        sprites[current_row].play_animation(anim_name)
 
     def on_key(key):
         if key in (pygame.K_q, pygame.K_ESCAPE):
@@ -238,6 +273,12 @@ def main():
         elif key == pygame.K_UP:
             new_row = (current_row - 1) % rows
             switch_animation(new_row)
+        elif key == pygame.K_LEFT:
+            step_frame(-1)
+        elif key == pygame.K_RIGHT:
+            step_frame(1)
+        elif key == pygame.K_p:
+            resume_autoplay()
         elif key in (pygame.K_l, pygame.K_SPACE):
             toggle_loop()
         elif pygame.K_1 <= key <= pygame.K_9:
@@ -250,6 +291,8 @@ def main():
     print(f"  FPS: {args.fps}")
     print(f"\nControls:")
     print(f"  Up/Down: Cycle animations (rows)")
+    print(f"  Left/Right: Step frames (cancels autoplay)")
+    print(f"  P: Resume autoplay")
     print(f"  L or Space: Toggle loop/one-shot")
     print(f"  Q or ESC: Quit\n")
 
