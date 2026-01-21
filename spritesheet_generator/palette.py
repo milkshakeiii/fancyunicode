@@ -37,12 +37,64 @@ except ImportError:
 Color = Tuple[int, int, int, int]
 
 # Default sensitivity for auto-detecting optimal color count
-DEFAULT_SENSITIVITY = 2.5
+# 1.0 = use elbow as-is, <1.0 = fewer colors, >1.0 = more colors
+DEFAULT_SENSITIVITY = 1.0
+
+# Default threshold for snapping near-grey colors to exact grey
+DEFAULT_GREY_THRESHOLD = 15
 
 
 # =============================================================================
 # CORE PALETTE FUNCTIONS
 # =============================================================================
+
+def is_near_grey(color: Tuple[int, ...], threshold: int = DEFAULT_GREY_THRESHOLD) -> bool:
+    """
+    Check if a color is close to greyscale.
+
+    Args:
+        color: Color as (R, G, B) or (R, G, B, A)
+        threshold: Max difference between R, G, B to be considered grey
+
+    Returns:
+        True if the color is near greyscale
+    """
+    r, g, b = color[0], color[1], color[2]
+    return abs(r - g) < threshold and abs(g - b) < threshold and abs(r - b) < threshold
+
+
+def snap_to_grey(color: Tuple[int, ...], threshold: int = DEFAULT_GREY_THRESHOLD) -> Tuple[int, ...]:
+    """
+    Snap a near-grey color to exact grey (R==G==B).
+
+    Args:
+        color: Color as (R, G, B) or (R, G, B, A)
+        threshold: Max difference between R, G, B to be considered grey
+
+    Returns:
+        Original color if not near grey, else exact grey version
+    """
+    r, g, b = color[0], color[1], color[2]
+    if abs(r - g) < threshold and abs(g - b) < threshold and abs(r - b) < threshold:
+        grey = (r + g + b) // 3
+        if len(color) > 3:
+            return (grey, grey, grey, color[3])
+        return (grey, grey, grey)
+    return color
+
+
+def snap_palette_greys(palette: List[Color], threshold: int = DEFAULT_GREY_THRESHOLD) -> List[Color]:
+    """
+    Snap all near-grey colors in a palette to exact grey.
+
+    Args:
+        palette: List of (R, G, B, A) color tuples
+        threshold: Max difference between R, G, B to be considered grey
+
+    Returns:
+        New palette with near-greys snapped to exact grey
+    """
+    return [snap_to_grey(c, threshold) for c in palette]
 
 def color_distance(c1: Tuple[int, ...], c2: Tuple[int, ...]) -> float:
     """
@@ -232,9 +284,14 @@ def detect_optimal_colors(img: Image.Image, min_k: int = 4, max_k: int = 16,
     elbow_idx = np.argmax(distances)
     optimal_k = k_values[elbow_idx]
 
-    # Apply sensitivity bias toward more colors
-    # sensitivity > 1 shifts toward more colors
-    if sensitivity > 1.0:
+    # Apply sensitivity bias
+    # sensitivity < 1.0: bias toward fewer colors
+    # sensitivity > 1.0: bias toward more colors
+    if sensitivity < 1.0:
+        # Reduce colors based on how far below 1.0
+        reduction = int((1.0 - sensitivity) * (optimal_k - min_k))
+        optimal_k = max(optimal_k - reduction, min_k)
+    elif sensitivity > 1.0:
         # Add extra colors based on sensitivity
         bonus = int((sensitivity - 1.0) * (max_k - optimal_k) * 0.5)
         optimal_k = min(optimal_k + bonus, max_k)

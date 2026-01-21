@@ -17,15 +17,16 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
-def is_green_pixel(rgb: np.ndarray, threshold: int = 100) -> np.ndarray:
+def is_green_pixel(rgb: np.ndarray, threshold: int = 50) -> np.ndarray:
     """
-    Check if pixels are "green-ish" (close to chroma key green #00FF00).
+    Check if pixels are chroma key green (#00FF00).
 
     Returns boolean mask where True = green pixel.
+    Strict check to avoid catching natural greens in sprites.
     """
     r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
-    # Green channel should be high, red and blue should be low
-    return (g > 200) & (r < threshold) & (b < threshold)
+    # Green channel should be very high, red and blue very low
+    return (g > 240) & (r < threshold) & (b < threshold)
 
 
 def detect_grid_size(img: Image.Image, min_cell_size: int = 4, max_cell_size: int = 100) -> Tuple[int, int]:
@@ -454,13 +455,13 @@ def extract_pixels(
             pixel_color = arr[center_y, center_x]
 
             if remove_green:
-                # Check if it's green (background)
-                # More lenient: green is dominant channel and reasonably bright
+                # Check if it's chroma key green (#00FF00)
+                # Strict: only catch bright green with very low R and B
                 r, g, b = int(pixel_color[0]), int(pixel_color[1]), int(pixel_color[2])
                 is_green = (
-                    g > r + 30 and  # G significantly higher than R
-                    g > b + 30 and  # G significantly higher than B
-                    g > 100         # G is reasonably bright
+                    g > 240 and  # G very high (close to 255)
+                    r < 50 and   # R very low
+                    b < 50       # B very low
                 )
 
                 if is_green:

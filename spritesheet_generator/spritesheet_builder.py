@@ -5,7 +5,12 @@ Spritesheet Builder
 Builds spritesheets using Gemini image generation and pixelgrid extraction.
 Generates consistent pixel art animations with automatic palette management.
 
-Example workflow:
+Single sprite generation (for inventory items, etc.):
+    python3 spritesheet_builder.py single items/iron_ore.png "iron ore"
+    python3 spritesheet_builder.py single items/silk.png "silk thread" --cell-size 16x16
+    python3 spritesheet_builder.py single items/sword.png "iron sword" --colors 8
+
+Example workflow for animated spritesheets:
     # 1. Create project with base sprite
     python3 spritesheet_builder.py init output/warrior "a warrior with sword and shield" \\
         --style "Few colors and simple shapes"
@@ -67,7 +72,10 @@ from palette import (
     palette_from_json,
     color_to_hex,
     detect_optimal_colors,
+    snap_palette_greys,
+    is_near_grey,
     DEFAULT_SENSITIVITY,
+    DEFAULT_GREY_THRESHOLD,
 )
 
 
@@ -87,6 +95,16 @@ FRAME_STYLE_PROMPT = """The image should be on a solid bright green (#00FF00) ba
 No shadows on the green background.
 The green background should be completely uniform #00FF00.
 The entire image should be filled with the green background, edge to edge, no white or other colors."""
+
+# For single item sprites (inventory icons)
+ITEM_STYLE_PROMPT = """The image should be on a solid bright green (#00FF00) background for easy chroma keying.
+The item should be centered and fill most of the frame with a small margin.
+Top-down or 3/4 isometric view typical of crafting game inventory icons.
+Extremely simple, chunky pixel art style.
+Use flat solid colors with NO gradients, NO shading, NO anti-aliasing, NO outlines.
+Bold, recognizable silhouette. Maximum 8-12 colors.
+The green background must be completely uniform #00FF00.
+Fill the entire image edge-to-edge with green background, no other background colors."""
 
 METADATA_FILENAME = "metadata.json"
 
@@ -803,6 +821,171 @@ def cmd_quantize(args) -> int:
         return 1
 
 
+def find_dominant_color(img: Image.Image) -> Tuple[int, int, int]:
+    """Find the most common color in an image (ignoring transparency)."""
+    from collections import Counter
+    img = img.convert("RGBA")
+    pixels = list(img.getdata())
+    # Filter out transparent pixels
+    opaque = [p[:3] for p in pixels if p[3] > 0]
+    if not opaque:
+        return (128, 128, 128)
+    most_common = Counter(opaque).most_common(1)[0][0]
+    return most_common
+
+
+def cmd_single(args) -> int:
+    """Generate a single sprite without project scaffolding."""
+    import tempfile
+
+    output_path: Path = args.output
+    subject: str = args.subject
+    custom_prompt: Optional[str] = args.prompt
+    cell_size: Tuple[int, int] = parse_size_arg(args.cell_size)
+    resolution: Tuple[int, int] = parse_size_arg(args.resolution) if args.resolution else cell_size
+    colors: Optional[int] = args.colors
+    sensitivity: float = args.sensitivity
+    color_role: Optional[str] = args.color_role
+    # Snap greys only if explicitly requested OR if color_role is "taker"
+    snap_greys: bool = args.snap_greys or (color_role == "taker")
+    color_input: Optional[int] = args.color_input
+    source_color_arg: Optional[str] = args.source_color
+    palette_hint: Optional[str] = args.palette_hint
+    palette_from: Optional[Path] = args.palette_from
+
+    # Build the prompt
+    if custom_prompt:
+        full_prompt = custom_prompt
+    else:
+        palette_instruction = ""
+        if palette_hint:
+            palette_instruction = f"\nUse these colors: {palette_hint}."
+
+        full_prompt = f"""Create pixel art of "{subject}" for a crafting game inventory icon.
+The item should be {resolution[0]}x{resolution[1]} pixels in size.{palette_instruction}
+{ITEM_STYLE_PROMPT}"""
+
+    print(f"Generating: {subject}")
+    print(f"Output: {output_path}")
+    print(f"Resolution hint: {resolution[0]}x{resolution[1]}")
+    print(f"Cell size: {cell_size[0]}x{cell_size[1]}")
+    if palette_hint:
+        print(f"Palette hint: {palette_hint}")
+    if snap_greys:
+        print(f"Snap greys: enabled")
+
+    # Create output directory if needed
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use temp directory for raw image
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw_path = Path(tmpdir) / "raw.png"
+
+        # Generate image
+        generate_image(full_prompt, raw_path)
+
+        # Extract pixels using pixelgrid (crops to content)
+        extracted_path = Path(tmpdir) / "extracted.png"
+        extracted_size, detected_cell_size, _ = extract_sprite(raw_path, extracted_path)
+
+        # Load extracted sprite
+        result = Image.open(extracted_path).convert("RGBA")
+        print(f"Extracted size: {result.size[0]}x{result.size[1]}")
+
+        # Quantize
+        palette = None
+        if not args.no_quantize:
+            # Load palette from another item, or extract new one
+            if palette_from:
+                with open(palette_from) as f:
+                    source_meta = json.load(f)
+                palette = palette_from_json(source_meta["palette"])
+                print(f"Using palette from {palette_from} ({len(palette)} colors)")
+            else:
+                num_colors = colors
+                if num_colors is None:
+                    num_colors = detect_optimal_colors(result, sensitivity=sensitivity)
+                    print(f"Auto-detected {num_colors} colors")
+
+                palette = extract_palette(result, num_colors)
+
+                # Snap near-grey colors to exact grey
+                if snap_greys:
+                    palette = snap_palette_greys(palette)
+                    print(f"Snapped near-greys to exact grey")
+
+            result = quantize_to_palette(result, palette)
+            print(f"Quantized to {len(palette)} colors")
+
+        # Pad to nearest cell_size multiple
+        frame_size = round_to_cell_multiple(result.size, cell_size)
+        if result.size != frame_size:
+            result = pad_frame_to_size(result, frame_size)
+            print(f"Padded to: {frame_size[0]}x{frame_size[1]}")
+
+        result.save(output_path)
+        print(f"Saved: {output_path} ({result.size[0]}x{result.size[1]})")
+
+        # Show preview: raw Gemini image and scaled-up result side by side
+        raw_img = Image.open(raw_path)
+        # Scale up result to be visible (10x)
+        scale = 10
+        result_scaled = result.resize(
+            (result.size[0] * scale, result.size[1] * scale),
+            Image.Resampling.NEAREST
+        )
+        # Create side-by-side comparison
+        # Resize raw to match height of scaled result
+        raw_height = result_scaled.size[1]
+        raw_aspect = raw_img.size[0] / raw_img.size[1]
+        raw_resized = raw_img.resize(
+            (int(raw_height * raw_aspect), raw_height),
+            Image.Resampling.LANCZOS
+        )
+        # Combine
+        preview_width = raw_resized.size[0] + result_scaled.size[0] + 10
+        preview = Image.new("RGBA", (preview_width, raw_height), (40, 40, 40, 255))
+        preview.paste(raw_resized, (0, 0))
+        preview.paste(result_scaled, (raw_resized.size[0] + 10, 0))
+        preview_path = output_path.parent / f"{output_path.stem}_preview.png"
+        preview.save(preview_path)
+        subprocess.run(["xdg-open", str(preview_path)], check=False)
+
+        # Build and save metadata
+        metadata = {
+            "name": subject,
+        }
+
+        if palette:
+            metadata["palette"] = palette_to_json(palette)
+
+        if color_role:
+            metadata["color_role"] = color_role
+            if color_role == "source":
+                # Determine source color
+                if source_color_arg:
+                    # Parse "R,G,B" format
+                    parts = [int(x.strip()) for x in source_color_arg.split(",")]
+                    source_color = tuple(parts[:3])
+                else:
+                    # Auto-detect dominant color
+                    source_color = find_dominant_color(result)
+                metadata["source_color"] = list(source_color)
+                print(f"Source color: RGB{source_color}")
+            elif color_role == "taker":
+                if color_input is not None:
+                    metadata["color_input_index"] = color_input
+                    print(f"Color input index: {color_input}")
+
+        # Save metadata JSON
+        metadata_path = output_path.with_suffix(".json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Saved metadata: {metadata_path}")
+
+    return 0
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -854,10 +1037,39 @@ def main():
     p_quantize.add_argument("--sensitivity", "-s", type=float, default=DEFAULT_SENSITIVITY,
                             help=f"Sensitivity for auto-detection (higher = more colors, default: {DEFAULT_SENSITIVITY})")
 
+    # single
+    p_single = subparsers.add_parser("single", help="Generate a single sprite (no project scaffolding)")
+    p_single.add_argument("output", type=Path, help="Output file path (e.g., items/iron_ore.png)")
+    p_single.add_argument("subject", help="What to generate (e.g., 'iron ore', 'wooden plank')")
+    p_single.add_argument("--prompt", type=str, default=None,
+                          help="Override the full prompt (ignores subject)")
+    p_single.add_argument("--cell-size", default="10x20",
+                          help="Frame size rounding as WxH (default: 10x20)")
+    p_single.add_argument("--resolution", default=None,
+                          help="Resolution hint for Gemini as WxH (default: same as cell-size)")
+    p_single.add_argument("--colors", "-c", type=int, default=None,
+                          help="Number of palette colors (default: auto-detect)")
+    p_single.add_argument("--sensitivity", "-s", type=float, default=DEFAULT_SENSITIVITY,
+                          help=f"Sensitivity for color auto-detection (default: {DEFAULT_SENSITIVITY})")
+    p_single.add_argument("--no-quantize", action="store_true",
+                          help="Skip palette quantization")
+    p_single.add_argument("--snap-greys", action="store_true",
+                          help="Snap near-grey colors to exact grey (auto-enabled for takers)")
+    p_single.add_argument("--palette-hint", type=str, default=None,
+                          help="Color hints for Gemini (e.g., 'silver grey, dark grey')")
+    p_single.add_argument("--color-role", choices=["source", "taker"], default=None,
+                          help="Color role: 'source' provides color, 'taker' receives color from inputs")
+    p_single.add_argument("--color-input", type=int, default=None,
+                          help="For takers: which recipe input index provides the color")
+    p_single.add_argument("--source-color", type=str, default=None,
+                          help="For sources: the color provided as 'R,G,B' (default: auto-detect)")
+    p_single.add_argument("--palette-from", type=Path, default=None,
+                          help="Use palette from another item's JSON (e.g., item_sprites/silkworm_cacoons.json)")
+
     args = parser.parse_args()
 
     # Check for API key
-    if args.command in ("init", "add-frame"):
+    if args.command in ("init", "add-frame", "single"):
         if not os.environ.get("GOOGLE_API_KEY") and not os.environ.get("GEMINI_API_KEY"):
             print("Error: GOOGLE_API_KEY or GEMINI_API_KEY environment variable not set")
             print("Get an API key from https://aistudio.google.com/")
@@ -876,6 +1088,8 @@ def main():
         sys.exit(cmd_show(args))
     elif args.command == "quantize":
         sys.exit(cmd_quantize(args))
+    elif args.command == "single":
+        sys.exit(cmd_single(args))
 
 
 if __name__ == "__main__":
