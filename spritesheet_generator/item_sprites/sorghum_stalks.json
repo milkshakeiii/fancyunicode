@@ -1,9 +1,9 @@
 {
-  "name": "rice stalks",
+  "name": "sorghum stalks",
   "color_role": "source",
   "source_color": [
-    200,
     180,
+    140,
     100
   ]
 }

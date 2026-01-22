@@ -1,9 +1,9 @@
 {
-  "name": "rice stalks",
+  "name": "hungry rice stalks",
   "color_role": "source",
   "source_color": [
-    200,
     180,
-    100
+    160,
+    120
   ]
 }

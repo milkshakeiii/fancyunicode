@@ -1,9 +1,9 @@
 {
-  "name": "rice stalks",
+  "name": "black clay",
   "color_role": "source",
   "source_color": [
-    200,
-    180,
-    100
+    50,
+    50,
+    55
   ]
 }
