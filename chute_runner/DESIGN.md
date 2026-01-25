@@ -49,10 +49,11 @@ A gate-runner dungeon crawl powered by a compact factory: build injectors and ma
   - Capacity (how many tokens they can buffer).
   - Pull rate (how fast the top lane can drain them).
   - Intake ports (where injectors can feed items).
-- Injectors are the core interaction:
-  - They pull items off belts or directly from machine outputs.
-  - They launch items into a chosen chute intake (think Factorio inserters, but aimed at vertical chutes).
-  - Upgrades improve speed, stack size, or filtering.
+- Injectors are the core interaction (Factorio inserter equivalent):
+  - They handle all item movement: belt ↔ machine, machine ↔ machine, belt ↔ chute.
+  - Machines have no built-in I/O; injectors must feed inputs and extract outputs.
+  - They can also launch items into chute intakes.
+  - Upgrades improve speed, stack size, reach, or filtering.
 - Chute pressure:
   - If a chute is full, injectors jam and back up the line.
   - If a chute is empty, gates stall or damage the runner.
