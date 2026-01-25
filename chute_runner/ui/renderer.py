@@ -278,28 +278,45 @@ class Renderer:
 
     def render_hud(self):
         """Render HUD overlay."""
-        # Clear just the areas we draw on
         phase = self.game.phase
+
+        # Bottom HUD area (below factory, rows 18-23)
+        hud_y = TOP_LANE_HEIGHT + FACTORY_HEIGHT  # Row 18
 
         # Phase indicator
         phase_str = {
-            GamePhase.PRE_RUN: "BUILD PHASE",
-            GamePhase.RUNNING: "RUNNING",
-            GamePhase.WON: "VICTORY!",
-            GamePhase.LOST: "GAME OVER",
+            GamePhase.PRE_RUN: "BUILD",
+            GamePhase.RUNNING: "RUN!",
+            GamePhase.WON: "WIN!",
+            GamePhase.LOST: "DEAD",
         }[phase]
 
         color = (100, 255, 100) if phase in (GamePhase.PRE_RUN, GamePhase.WON) else (255, 100, 100)
-        self.hud_window.put_string(1, SCREEN_HEIGHT - 1, phase_str, color)
+        self.hud_window.put_string(1, hud_y, phase_str, color)
 
         # Pre-run timer
         if phase == GamePhase.PRE_RUN:
             remaining = self.game.get_pre_run_time_remaining()
-            self.hud_window.put_string(15, SCREEN_HEIGHT - 1, f"Time: {remaining:.1f}s", COLOR_HUD)
+            self.hud_window.put_string(8, hud_y, f"{remaining:.0f}s [S]=Start", COLOR_HUD)
 
         # Selected building indicator
         if self.selected_building:
-            self.hud_window.put_string(30, SCREEN_HEIGHT - 1, f"[{self.selected_building}]", COLOR_HUD)
+            sel_str = f"[{self.selected_building.upper()}]"
+            if hasattr(self, 'selected_direction') and self.selected_building == 'belt':
+                sel_str += f" {BELT_CHARS.get(self.selected_direction, '?')}"
+            if hasattr(self, 'chute_target') and self.chute_target:
+                sel_str += f" ->CHUTE:{self.chute_target.name}"
+            elif self.selected_building == 'injector':
+                sel_str += " [T]=chute"
+            self.hud_window.put_string(1, hud_y + 1, sel_str, (255, 255, 100))
+
+        # Help (compact)
+        help_color = (100, 100, 120)
+        self.hud_window.put_string(1, hud_y + 2, "QWE=Src 7890-==Mach 1234=Belt 6=Inj", help_color)
+        self.hud_window.put_string(1, hud_y + 3, "Space=Build X=Del T=Chute Arrows=Move", help_color)
+
+        # Cursor position
+        self.hud_window.put_string(1, hud_y + 4, f"({self.cursor_x},{self.cursor_y})", (80, 80, 100))
 
     def move_cursor(self, dx: int, dy: int):
         """Move the build cursor."""

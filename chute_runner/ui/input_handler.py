@@ -103,9 +103,11 @@ class InputHandler:
     def _select_building(self, building_type: str, param):
         """Select a building type for placement."""
         self.renderer.selected_building = building_type
+        self.renderer.chute_target = None  # Reset chute target
 
         if building_type == 'belt':
             self._selected_direction = param
+            self.renderer.selected_direction = param  # Sync to renderer for HUD
         elif building_type == 'machine':
             self._selected_machine_type = param
         elif building_type == 'source':
@@ -173,6 +175,7 @@ class InputHandler:
         current_idx = targets.index(self.injector_chute_target) if self.injector_chute_target in targets else 0
         next_idx = (current_idx + 1) % len(targets)
         self.injector_chute_target = targets[next_idx]
+        self.renderer.chute_target = self.injector_chute_target  # Sync to renderer for HUD
 
     def handle_held_keys(self, dt: float):
         """
