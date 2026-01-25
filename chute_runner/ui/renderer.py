@@ -144,9 +144,7 @@ class Renderer:
 
     def render_factory(self):
         """Render the factory grid."""
-        self.factory_window.clear()
-
-        # Draw grid background
+        # Draw grid background (overwrites previous frame)
         for y in range(self.game.grid.height):
             for x in range(self.game.grid.width):
                 entity = self.game.grid.get_entity(x, y)
@@ -207,7 +205,10 @@ class Renderer:
 
     def render_top_lane(self):
         """Render the gate runner lane."""
-        self.top_lane_window.clear()
+        # Fill with background first
+        for y in range(TOP_LANE_HEIGHT):
+            for x in range(SCREEN_WIDTH):
+                self.top_lane_window.put(x, y, ' ', (30, 30, 40))
 
         # Get runner state
         pos, hp, max_hp, alive = self.game.get_runner_state()
@@ -255,7 +256,10 @@ class Renderer:
 
     def render_chutes(self):
         """Render the chute bank."""
-        self.chute_window.clear()
+        # Fill with background first
+        for y in range(FACTORY_HEIGHT):
+            for x in range(CHUTE_BANK_WIDTH):
+                self.chute_window.put(x, y, ' ', (35, 30, 40))
 
         chute_data = [
             (ItemType.SWORD, 'SWORD', COLOR_CHUTE_SWORD, '†'),
