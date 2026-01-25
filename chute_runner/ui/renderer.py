@@ -205,11 +205,6 @@ class Renderer:
 
     def render_top_lane(self):
         """Render the gate runner lane."""
-        # Fill with background first
-        for y in range(TOP_LANE_HEIGHT):
-            for x in range(SCREEN_WIDTH):
-                self.top_lane_window.put(x, y, ' ', (30, 30, 40))
-
         # Get runner state
         pos, hp, max_hp, alive = self.game.get_runner_state()
 
@@ -256,11 +251,6 @@ class Renderer:
 
     def render_chutes(self):
         """Render the chute bank."""
-        # Fill with background first
-        for y in range(FACTORY_HEIGHT):
-            for x in range(CHUTE_BANK_WIDTH):
-                self.chute_window.put(x, y, ' ', (35, 30, 40))
-
         chute_data = [
             (ItemType.SWORD, 'SWORD', COLOR_CHUTE_SWORD, '†'),
             (ItemType.SHIELD, 'SHIELD', COLOR_CHUTE_SHIELD, '◊'),
