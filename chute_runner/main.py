@@ -37,6 +37,7 @@ import pyunicodegame
 
 from gameplay.game import Game, GamePhase
 from gameplay.level import create_test_level, create_tutorial_level
+from gameplay.tutorial import create_tutorial
 from ui.renderer import Renderer, SCREEN_WIDTH, SCREEN_HEIGHT
 from ui.input_handler import InputHandler
 
@@ -46,9 +47,18 @@ def main():
     print("Chute Runner - Starting...")
     print(__doc__)
 
-    # Create game with tutorial level for testing
+    # Check for --skip-tutorial flag
+    skip_tutorial = '--skip-tutorial' in sys.argv
+
+    # Create game with tutorial enabled by default
     level = create_tutorial_level()
-    game = Game(level=level)
+    if skip_tutorial:
+        game = Game(level=level)
+        print("Tutorial disabled. All buildings available.")
+    else:
+        tutorial = create_tutorial()
+        game = Game(level=level, tutorial=tutorial)
+        print("Tutorial mode enabled. Buildings unlock as you progress.")
 
     # Initialize pyunicodegame
     root = pyunicodegame.init(
@@ -66,10 +76,12 @@ def main():
 
     # Track if we should quit
     should_quit = False
+    last_dt = 0.016  # Track dt for renderer
 
     def update(dt: float):
         """Update game state."""
-        nonlocal should_quit
+        nonlocal should_quit, last_dt
+        last_dt = dt
 
         # Update game logic
         events = game.update(dt)
@@ -83,7 +95,7 @@ def main():
 
     def render():
         """Render game state."""
-        renderer.render()
+        renderer.render(last_dt)
 
     def on_key(key: int):
         """Handle key press."""

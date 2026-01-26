@@ -109,6 +109,13 @@ class Renderer:
         self.cursor_y = 0
         self.selected_building = None
 
+        # Tutorial feedback
+        self.locked_message = None
+        self.locked_message_timer = 0.0
+
+        # Track last frame time for timers
+        self._last_dt = 0.0
+
     def init_windows(self):
         """Initialize pyunicodegame windows."""
         # Factory grid window (bottom left)
@@ -135,8 +142,16 @@ class Renderer:
             z_index=10, bg=None, fixed=True
         )
 
-    def render(self):
+    def render(self, dt: float = 0.016):
         """Render entire game state."""
+        self._last_dt = dt
+
+        # Update timers
+        if self.locked_message_timer > 0:
+            self.locked_message_timer -= dt
+            if self.locked_message_timer <= 0:
+                self.locked_message = None
+
         self.render_factory()
         self.render_top_lane()
         self.render_chutes()
@@ -294,10 +309,11 @@ class Renderer:
         color = (100, 255, 100) if phase in (GamePhase.PRE_RUN, GamePhase.WON) else (255, 100, 100)
         self.hud_window.put_string(1, hud_y, phase_str, color)
 
-        # Pre-run timer
+        # Pre-run timer (only show if gates are active)
         if phase == GamePhase.PRE_RUN:
-            remaining = self.game.get_pre_run_time_remaining()
-            self.hud_window.put_string(8, hud_y, f"{remaining:.0f}s [S]=Start", COLOR_HUD)
+            if self.game.tutorial is None or self.game.tutorial.are_gates_enabled():
+                remaining = self.game.get_pre_run_time_remaining()
+                self.hud_window.put_string(8, hud_y, f"{remaining:.0f}s [S]=Start", COLOR_HUD)
 
         # Selected building indicator
         if self.selected_building:
@@ -310,13 +326,32 @@ class Renderer:
                 sel_str += " [T]=chute"
             self.hud_window.put_string(1, hud_y + 1, sel_str, (255, 255, 100))
 
-        # Help (compact)
-        help_color = (100, 100, 120)
-        self.hud_window.put_string(1, hud_y + 2, "QWE=Src 7890-==Mach 1234=Belt 6=Inj", help_color)
-        self.hud_window.put_string(1, hud_y + 3, "Space=Build X=Del T=Chute Arrows=Move", help_color)
+        # Tutorial instruction OR standard help
+        tutorial_instruction = self.game.get_tutorial_instruction()
+        if tutorial_instruction:
+            # Show tutorial instruction with step number
+            if self.game.tutorial:
+                step_num = self.game.tutorial.get_step_number()
+                total_steps = self.game.tutorial.get_total_steps()
+                step_str = f"{step_num}/{total_steps} "
+            else:
+                step_str = ""
+            instruction_color = (255, 220, 100)
+            self.hud_window.put_string(1, hud_y + 2, step_str + tutorial_instruction, instruction_color)
+        else:
+            # Standard help (compact)
+            help_color = (100, 100, 120)
+            self.hud_window.put_string(1, hud_y + 2, "QWE=Src 7890-==Mach 1234=Belt 6=Inj", help_color)
 
-        # Cursor position
-        self.hud_window.put_string(1, hud_y + 4, f"({self.cursor_x},{self.cursor_y})", (80, 80, 100))
+        # Secondary help line
+        self.hud_window.put_string(1, hud_y + 3, "Spc=Build X=Del T=Chute", (100, 100, 120))
+
+        # Locked message (flashing red when trying locked building)
+        if self.locked_message:
+            self.hud_window.put_string(1, hud_y + 4, self.locked_message, (255, 80, 80))
+        else:
+            # Cursor position
+            self.hud_window.put_string(1, hud_y + 4, f"({self.cursor_x},{self.cursor_y})", (80, 80, 100))
 
     def move_cursor(self, dx: int, dy: int):
         """Move the build cursor."""

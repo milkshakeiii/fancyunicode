@@ -16,6 +16,7 @@ from .chutes import ChuteBank
 from .runner import Runner, GateSequence, GateResult
 from .level import create_test_level
 from .constants import FACTORY_WIDTH, FACTORY_HEIGHT, PRE_RUN_TIME
+from .tutorial import TutorialState
 
 
 class GamePhase(Enum):
@@ -69,7 +70,7 @@ class Game:
             # UI reads game state and renders
     """
 
-    def __init__(self, level: Optional[GateSequence] = None):
+    def __init__(self, level: Optional[GateSequence] = None, tutorial: Optional[TutorialState] = None):
         # Factory grid
         self.grid = Grid(FACTORY_WIDTH, FACTORY_HEIGHT)
 
@@ -79,6 +80,9 @@ class Game:
         # Runner and gates
         self.runner = Runner()
         self.gate_sequence = level if level else create_test_level()
+
+        # Tutorial state (optional)
+        self.tutorial = tutorial
 
         # Game state
         self.phase = GamePhase.PRE_RUN
@@ -180,6 +184,10 @@ class Game:
         """
         self._events = []
 
+        # Check tutorial progression
+        if self.tutorial is not None:
+            self.tutorial.check_and_advance(self)
+
         if self.phase == GamePhase.PRE_RUN:
             self._update_pre_run(dt)
         elif self.phase == GamePhase.RUNNING:
@@ -192,6 +200,10 @@ class Game:
         """Update during pre-run phase."""
         # Factory still runs during pre-run
         self._update_factory(dt)
+
+        # In tutorial mode, don't count down until gates are enabled
+        if self.tutorial is not None and not self.tutorial.are_gates_enabled():
+            return
 
         # Count down to run start
         self.pre_run_timer -= dt
@@ -274,6 +286,25 @@ class Game:
     def get_pre_run_time_remaining(self) -> float:
         """Get seconds remaining in pre-run phase."""
         return max(0.0, self.pre_run_timer)
+
+    def is_building_allowed(self, building_key: str) -> bool:
+        """
+        Check if a building key is allowed (for tutorial filtering).
+        Returns True if no tutorial or building is unlocked.
+        """
+        if self.tutorial is None:
+            return True
+        return building_key in self.tutorial.get_unlocked_buildings()
+
+    def get_tutorial_instruction(self) -> Optional[str]:
+        """Get current tutorial instruction, or None if not in tutorial."""
+        if self.tutorial is None:
+            return None
+        return self.tutorial.get_instruction()
+
+    def is_tutorial_active(self) -> bool:
+        """Check if tutorial is active and not complete."""
+        return self.tutorial is not None and not self.tutorial.is_complete()
 
     # =========================================================================
     # CONVENIENCE METHODS FOR TESTING

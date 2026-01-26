@@ -30,6 +30,29 @@ BUILDING_KEYS = {
 }
 
 
+def get_building_key(building_type: str, param) -> str:
+    """Convert building_type and param to tutorial unlock key string."""
+    if building_type == 'belt':
+        return 'belt'
+    elif building_type == 'splitter':
+        return 'splitter'
+    elif building_type == 'injector':
+        return 'injector'
+    elif building_type == 'machine':
+        # Machine type enum to lowercase name
+        return param.name.lower()
+    elif building_type == 'source':
+        # Source type: ORE_MINE -> source_ore
+        name = param.name.lower()
+        if name == 'ore_mine':
+            return 'source_ore'
+        elif name == 'fiber_garden':
+            return 'source_fiber'
+        elif name == 'oil_well':
+            return 'source_oil'
+    return building_type
+
+
 class InputHandler:
     """
     Handles keyboard input and translates to game commands.
@@ -102,6 +125,13 @@ class InputHandler:
 
     def _select_building(self, building_type: str, param):
         """Select a building type for placement."""
+        # Check if building is allowed (tutorial filtering)
+        building_key = get_building_key(building_type, param)
+        if not self.game.is_building_allowed(building_key):
+            self.renderer.locked_message = "Not unlocked yet!"
+            self.renderer.locked_message_timer = 1.5  # Show for 1.5 seconds
+            return
+
         self.renderer.selected_building = building_type
         self.renderer.chute_target = None  # Reset chute target
 
